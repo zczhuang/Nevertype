@@ -35,7 +35,8 @@ let package = Package(
                 .linkedFramework("Speech"),
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Carbon"),
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedLibrary("sqlite3")
             ]
         )
     ]

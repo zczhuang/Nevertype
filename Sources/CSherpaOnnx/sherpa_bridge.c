@@ -48,6 +48,48 @@ TZ_SenseVoiceHandle *tz_sensevoice_create(const char *model_path,
     return h;
 }
 
+TZ_SenseVoiceHandle *tz_parakeet_create(const char *encoder_path,
+                                        const char *decoder_path,
+                                        const char *joiner_path,
+                                        const char *tokens_path,
+                                        int32_t num_threads) {
+    if (!encoder_path || !decoder_path || !joiner_path || !tokens_path) {
+        return NULL;
+    }
+
+    SherpaOnnxOfflineRecognizerConfig config;
+    memset(&config, 0, sizeof(config));
+
+    config.feat_config.sample_rate = 16000;
+    config.feat_config.feature_dim = 80;
+
+    config.model_config.transducer.encoder = encoder_path;
+    config.model_config.transducer.decoder = decoder_path;
+    config.model_config.transducer.joiner = joiner_path;
+    config.model_config.tokens = tokens_path;
+    // NeMo TDT checkpoints are exported as "nemo_transducer" in sherpa-onnx.
+    config.model_config.model_type = "nemo_transducer";
+    // Benchmarked on Apple Silicon: 4 threads decode as fast as 8 (7s audio in ~0.16s).
+    config.model_config.num_threads = num_threads > 0 ? num_threads : 4;
+    config.model_config.debug = 0;
+    config.model_config.provider = "cpu";
+
+    config.decoding_method = "greedy_search";
+
+    const SherpaOnnxOfflineRecognizer *rec = SherpaOnnxCreateOfflineRecognizer(&config);
+    if (!rec) {
+        return NULL;
+    }
+
+    TZ_SenseVoiceHandle *h = (TZ_SenseVoiceHandle *)calloc(1, sizeof(TZ_SenseVoiceHandle));
+    if (!h) {
+        SherpaOnnxDestroyOfflineRecognizer(rec);
+        return NULL;
+    }
+    h->recognizer = rec;
+    return h;
+}
+
 char *tz_sensevoice_transcribe(TZ_SenseVoiceHandle *handle,
                                const float *samples,
                                int32_t num_samples,

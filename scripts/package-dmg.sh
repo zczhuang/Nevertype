@@ -4,39 +4,33 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-APP_NAME="TypeZero"
-VERSION="0.5.8"
+# APP_NAME, VERSION (and BUNDLE_ID, PRODUCT_NAME) come from AppBrand.swift.
+source "$ROOT_DIR/scripts/brand.sh"
+
 DIST_DIR="$ROOT_DIR/dist"
 DMG_PATH="$DIST_DIR/${APP_NAME}-v${VERSION}-macOS-arm64.dmg"
-NOTARY_PROFILE="${NOTARY_PROFILE:-}"
-if [ -z "$NOTARY_PROFILE" ]; then
-    for cand in ScreenCapture-Notary TypeZeroNotary; do
-        if xcrun notarytool history --keychain-profile "$cand" >/dev/null 2>&1; then
-            NOTARY_PROFILE="$cand"
-            break
-        fi
-    done
-    NOTARY_PROFILE="${NOTARY_PROFILE:-ScreenCapture-Notary}"
-fi
+NOTARY_PROFILE="${NOTARY_PROFILE:-NevertypeNotary}"
 
 echo "==> 1. Building & signing ${APP_NAME}.app v${VERSION}..."
 "$ROOT_DIR/scripts/build-app.sh"
 "$ROOT_DIR/build/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" --self-test
 
 mkdir -p "$DIST_DIR"
-STAGE_DIR="$(mktemp -d -t typezero_dmg_stage)"
+STAGE_DIR="$(mktemp -d -t nevertype_dmg_stage)"
 trap '/usr/bin/trash "$STAGE_DIR" 2>/dev/null || true' EXIT
 
 ditto "$ROOT_DIR/build/${APP_NAME}.app" "$STAGE_DIR/${APP_NAME}.app"
 ln -s /Applications "$STAGE_DIR/Applications"
 
-cat > "$STAGE_DIR/首次安装说明.txt" <<'EOF'
-TypeZero (macOS 极速语音成稿工具) 快速安装指南
-==============================================
+cat > "$STAGE_DIR/Install ${APP_NAME}.txt" <<EOF
+${APP_NAME} quick install guide
+==============================
 
-1. 将「TypeZero.app」拖入右侧「Applications」文件夹；
-2. 打开 TypeZero（若首次打开遇到 macOS 安全提示，前往「系统设置 → 隐私与安全性」底部点一次「仍要打开」，或在终端执行：xattr -cr /Applications/TypeZero.app）；
-3. 按首次弹出的 3 步引导页：开启麦克风与辅助功能权限 -> 填入豆包语音与 DeepSeek 密钥 -> 选定快捷键即可在任意输入框开口成文。
+1. Drag "${APP_NAME}.app" onto the "Applications" folder next to it.
+2. Open ${APP_NAME}. If macOS blocks the first launch, open System Settings > Privacy & Security, scroll to the bottom and click
+   "Open Anyway" once, or run this in Terminal: xattr -cr /Applications/${APP_NAME}.app
+3. Follow the three setup steps: allow the microphone and Accessibility, download an on-device speech model (or paste your own
+   API keys), and pick the shortcut. Then press it in any text field and talk.
 EOF
 
 if [ -f "$DMG_PATH" ]; then

@@ -1,10 +1,11 @@
 import Foundation
 
 public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
-    case home = "洞察总览"
-    case history = "口述历史"
-    case dictionary = "个人词库"
-    case settings = "引擎与快捷键"
+    // Not persisted or decoded anywhere: the raw value doubles as the sidebar label, so it is plain English.
+    case home = "Overview"
+    case history = "History"
+    case dictionary = "Dictionary"
+    case settings = "Engine & shortcuts"
 
     public var id: String { rawValue }
 
@@ -19,8 +20,17 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
 }
 
 public enum DictationMode: String, Codable {
+    // The raw values are persisted inside history.json (`DictationRecord.mode`) - never rename them.
+    // Show `displayName` in the UI instead of `rawValue`.
     case dictate = "口述成稿"
     case rewriteSelection = "选中改写"
+
+    public var displayName: String {
+        switch self {
+        case .dictate: return "Dictation"
+        case .rewriteSelection: return "Rewrite selection"
+        }
+    }
 }
 
 public enum PipelinePhase: Equatable {
@@ -30,6 +40,78 @@ public enum PipelinePhase: Equatable {
     case completed(finalText: String, latencyMs: Int)
     case savedToClipboard(textPreview: String)
     case error(message: String)
+}
+
+/// Why a dictation could not start or had to stop, worded for two places.
+///
+/// `pillText` goes into the floating pill, which has room for two short lines (about 60 characters).
+/// `detail` is the complete explanation, shown by the main window as a warning banner.
+public struct DictationFailure: Equatable, Sendable {
+    /// Longest `pillText`, in characters.
+    public static let pillCharacterLimit = 60
+    /// How long the error pill stays on screen, in seconds: long enough to read two lines.
+    public static let displaySeconds: Double = 5.0
+
+    /// Pill text when the transcript held only filler sounds (see `PolishEngine.isFillerOnlyTranscript`). Nothing is wrong, so
+    /// there is no banner and the pill goes away sooner (`noSpeechDisplaySeconds`).
+    public static let noSpeechPillText = "No speech detected"
+    public static let noSpeechDisplaySeconds: Double = 2.0
+
+    public let pillText: String
+    public let detail: String
+
+    /// Main-window banner text. The leading emoji picks the banner style (see `TZStatusMessage`).
+    public var bannerText: String { "⚠️ " + detail }
+
+    public static let accessibilityOff = DictationFailure(
+        pillText: "Turn on Accessibility for \(AppBrand.name) in System Settings",
+        detail: "\(AppBrand.name) needs Accessibility access to type into other apps. Turn it on in System Settings → Privacy & Security → Accessibility, then try again."
+    )
+    public static let microphoneOff = DictationFailure(
+        pillText: "Allow microphone access in System Settings",
+        detail: "\(AppBrand.name) can't hear you because microphone access is off. Allow it in System Settings → Privacy & Security → Microphone, then try again."
+    )
+    public static let speechRecognitionOff = DictationFailure(
+        pillText: "Allow Speech Recognition in System Settings",
+        detail: "\(AppBrand.name) needs Speech Recognition access to transcribe your voice. Allow it in System Settings → Privacy & Security → Speech Recognition, then try again."
+    )
+    /// The fixed permission failures, for the self-tests.
+    public static let permissionFailures = [accessibilityOff, microphoneOff, speechRecognitionOff]
+
+    /// No speech model is installed and macOS cannot recognize speech on this Mac either. Dictation never falls back to
+    /// server recognition, so it stops here.
+    public static let onDeviceSpeechUnavailable = DictationFailure(
+        pillText: "Download a speech model in Settings",
+        detail: "\(AppBrand.name) needs a speech model. None is installed, and macOS on-device speech recognition isn't available for your language on this Mac. Download a speech model in Settings → Speech recognition. \(AppBrand.name) never sends your audio to Apple's servers."
+    )
+
+    /// Wraps an error reported by the speech engine. `detail` keeps its full wording on one line; `pillText` is a
+    /// copy cut down to `pillCharacterLimit` characters.
+    public static func engineError(_ message: String) -> DictationFailure {
+        let detail = message.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        if detail == onDeviceSpeechUnavailable.detail { return onDeviceSpeechUnavailable }
+        guard !detail.isEmpty else {
+            return DictationFailure(
+                pillText: "Dictation failed. Please try again.",
+                detail: "Dictation failed for an unknown reason. Please try again."
+            )
+        }
+        // The cloud failure prefix would otherwise use up half the pill before the actual reason starts.
+        let brief = detail.replacingOccurrences(of: "Cloud speech recognition failed:", with: "Cloud speech failed:")
+        return DictationFailure(pillText: shortened(brief, limit: pillCharacterLimit), detail: detail)
+    }
+
+    /// `text` unchanged when it has at most `limit` characters; otherwise cut at a word boundary (when that keeps at
+    /// least half of the allowed length) and ended with an ellipsis, so the result never exceeds `limit`.
+    static func shortened(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        var head = String(text.prefix(limit - 1))
+        if let space = head.lastIndex(of: " "), head.distance(from: head.startIndex, to: space) >= limit / 2 {
+            head = String(head[..<space])
+        }
+        let edgeCharacters = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+        return head.trimmingCharacters(in: edgeCharacters) + "…"
+    }
 }
 
 public enum TriggerKeyOption: String, CaseIterable, Codable, Identifiable, Sendable {
@@ -55,49 +137,49 @@ public enum TriggerKeyOption: String, CaseIterable, Codable, Identifiable, Senda
 
     public var displayName: String {
         switch self {
-        case .fnKey: return "Fn (地球键)"
-        case .leftOption: return "左侧 Option (⌥)"
-        case .rightOption: return "右侧 Option (⌥)"
-        case .leftCommand: return "左侧 Command (⌘)"
-        case .rightCommand: return "右侧 Command (⌘)"
-        case .leftControl: return "左侧 Control (⌃)"
-        case .rightControl: return "右侧 Control (⌃)"
-        case .leftShift: return "左侧 Shift (⇧)"
-        case .rightShift: return "右侧 Shift (⇧)"
+        case .fnKey: return "Fn (Globe)"
+        case .leftOption: return "Left Option (⌥)"
+        case .rightOption: return "Right Option (⌥)"
+        case .leftCommand: return "Left Command (⌘)"
+        case .rightCommand: return "Right Command (⌘)"
+        case .leftControl: return "Left Control (⌃)"
+        case .rightControl: return "Right Control (⌃)"
+        case .leftShift: return "Left Shift (⇧)"
+        case .rightShift: return "Right Shift (⇧)"
         case .optionSpace: return "Option + Space (⌥Space)"
-        case .custom: return "自定义快捷键"
+        case .custom: return "Custom shortcut"
         }
     }
 
     public var shortLabel: String {
         switch self {
-        case .fnKey: return "Fn 地球键"
-        case .leftOption: return "左侧 Option ⌥"
-        case .rightOption: return "右侧 Option ⌥"
-        case .leftCommand: return "左侧 Command ⌘"
-        case .rightCommand: return "右侧 Command ⌘"
-        case .leftControl: return "左侧 Control ⌃"
-        case .rightControl: return "右侧 Control ⌃"
-        case .leftShift: return "左侧 Shift ⇧"
-        case .rightShift: return "右侧 Shift ⇧"
+        case .fnKey: return "Fn (Globe)"
+        case .leftOption: return "Left Option ⌥"
+        case .rightOption: return "Right Option ⌥"
+        case .leftCommand: return "Left Command ⌘"
+        case .rightCommand: return "Right Command ⌘"
+        case .leftControl: return "Left Control ⌃"
+        case .rightControl: return "Right Control ⌃"
+        case .leftShift: return "Left Shift ⇧"
+        case .rightShift: return "Right Shift ⇧"
         case .optionSpace: return "⌥ + Space"
-        case .custom: return "自定义键"
+        case .custom: return "Custom"
         }
     }
 
     public var compactSidebarLabel: String {
         switch self {
-        case .fnKey: return "Fn 地球键"
-        case .leftOption: return "左 Option ⌥"
-        case .rightOption: return "右 Option ⌥"
-        case .leftCommand: return "左 Command ⌘"
-        case .rightCommand: return "右 Command ⌘"
-        case .leftControl: return "左 Control ⌃"
-        case .rightControl: return "右 Control ⌃"
-        case .leftShift: return "左 Shift ⇧"
-        case .rightShift: return "右 Shift ⇧"
+        case .fnKey: return "Fn (Globe)"
+        case .leftOption: return "Left Option"
+        case .rightOption: return "Right Option"
+        case .leftCommand: return "Left Command"
+        case .rightCommand: return "Right Command"
+        case .leftControl: return "Left Control"
+        case .rightControl: return "Right Control"
+        case .leftShift: return "Left Shift"
+        case .rightShift: return "Right Shift"
         case .optionSpace: return "⌥ + Space"
-        case .custom: return "自定义"
+        case .custom: return "Custom"
         }
     }
 
@@ -139,23 +221,25 @@ public struct CustomHotkeySpec: Codable, Equatable, Sendable {
 public enum ASRProviderOption: String, CaseIterable, Codable, Identifiable, Sendable {
     case volcSeedASR = "volcSeedASR"
     case openAIWhisper = "openAIWhisper"
+    /// Raw value is persisted. Despite the legacy name this is the generic "local offline engine" slot:
+    /// the model behind it (Parakeet TDT v2 or SenseVoice) is `LLMConfig.localASRModel`.
     case localSenseVoice = "localSenseVoice"
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .volcSeedASR: return "豆包流式语音大模型 2.0"
-        case .openAIWhisper: return "OpenAI / Groq 云端语音大模型"
-        case .localSenseVoice: return "纯本机 SenseVoice FP32 离线满血模型"
+        case .volcSeedASR: return "Doubao streaming speech model 2.0"
+        case .openAIWhisper: return "OpenAI / Groq cloud speech models"
+        case .localSenseVoice: return "Local offline engine (Parakeet / SenseVoice)"
         }
     }
 
     public var shortName: String {
         switch self {
-        case .volcSeedASR: return "豆包 Seed-ASR"
+        case .volcSeedASR: return "Doubao Seed-ASR"
         case .openAIWhisper: return "OpenAI / Groq"
-        case .localSenseVoice: return "本机 SenseVoice"
+        case .localSenseVoice: return "Local offline"
         }
     }
 }
@@ -174,36 +258,36 @@ public enum LLMProviderOption: String, CaseIterable, Codable, Identifiable, Send
     public var title: String {
         switch self {
         case .deepseek: return "DeepSeek 4 Flash"
-        case .volcengine: return "火山方舟 Doubao-Seed"
-        case .dashscope: return "阿里百炼 Qwen-Flash"
+        case .volcengine: return "Volcengine Ark Doubao-Seed"
+        case .dashscope: return "Alibaba DashScope Qwen-Flash"
         case .openai: return "OpenAI GPT"
         case .gemini: return "Google Gemini"
         case .anthropic: return "Anthropic Claude"
-        case .custom: return "自定义 OpenAI 兼容接口"
+        case .custom: return "Custom OpenAI-compatible endpoint"
         }
     }
 
     public var shortName: String {
         switch self {
         case .deepseek: return "DeepSeek"
-        case .volcengine: return "火山方舟"
-        case .dashscope: return "阿里百炼"
+        case .volcengine: return "Volcengine Ark"
+        case .dashscope: return "DashScope"
         case .openai: return "OpenAI"
         case .gemini: return "Gemini"
         case .anthropic: return "Claude"
-        case .custom: return "自定义接口"
+        case .custom: return "Custom endpoint"
         }
     }
 
     public var subtitle: String {
         switch self {
-        case .deepseek: return "极速主力推荐 · KV 缓存命中约 210ms 首包"
-        case .volcengine: return "字节豆包大模型 · 支持 Seed-2.1-lite 或 ep- 接入点"
-        case .dashscope: return "阿里云百炼兼容模式 · 通义极速轻量模型"
-        case .openai: return "OpenAI 官方直连 · 兼容 gpt-4.1-mini / gpt-5-mini / gpt-4o-mini"
-        case .gemini: return "Google AI Studio 官方兼容通道 · 支持 gemini-3.8-flash / 2.5-flash"
-        case .anthropic: return "Anthropic 原生 Messages 流式协议 · 支持 claude-haiku-5-5 / 4-5"
-        case .custom: return "支持 SiliconFlow / OpenRouter / MiniMax / 本地 Ollama"
+        case .deepseek: return "DeepSeek's OpenAI-compatible chat API"
+        case .volcengine: return "ByteDance Doubao models · supports Seed-2.1-lite or ep- endpoints"
+        case .dashscope: return "Alibaba Cloud OpenAI-compatible mode · Qwen models"
+        case .openai: return "Direct OpenAI API · works with gpt-4.1-mini / gpt-5-mini / gpt-4o-mini"
+        case .gemini: return "Google AI Studio OpenAI-compatible endpoint · supports gemini-3.8-flash / 2.5-flash"
+        case .anthropic: return "Anthropic native Messages streaming API · supports claude-haiku-5-5 / 4-5"
+        case .custom: return "Local Ollama · also works with SiliconFlow / OpenRouter / MiniMax"
         }
     }
 
@@ -215,7 +299,7 @@ public enum LLMProviderOption: String, CaseIterable, Codable, Identifiable, Send
         case .openai: return "https://api.openai.com/v1"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta/openai"
         case .anthropic: return "https://api.anthropic.com/v1"
-        case .custom: return "https://api.siliconflow.cn/v1"
+        case .custom: return "http://127.0.0.1:11434/v1"
         }
     }
 
@@ -227,7 +311,7 @@ public enum LLMProviderOption: String, CaseIterable, Codable, Identifiable, Send
         case .openai: return "gpt-4.1-mini"
         case .gemini: return "gemini-3.8-flash"
         case .anthropic: return "claude-haiku-5-5"
-        case .custom: return "deepseek-ai/DeepSeek-V3"
+        case .custom: return "gemma4:12b-mlx"
         }
     }
 
@@ -251,8 +335,8 @@ public enum TriggerBehavior: String, CaseIterable, Codable, Identifiable {
 
     public var displayName: String {
         switch self {
-        case .tapToggle: return "按一下开始 · 再按停止（免按住）"
-        case .holdToTalk: return "按住说话 · 松开停止"
+        case .tapToggle: return "Tap to start · tap again to stop (hands-free)"
+        case .holdToTalk: return "Hold to talk · release to stop"
         }
     }
 }
@@ -266,14 +350,16 @@ public enum FormattingStyle: String, CaseIterable, Codable, Identifiable {
 
     public var displayName: String {
         switch self {
-        case .structured: return "结构化精炼（去语病 · 自动分段/1.2.3.列点）"
-        case .lightPolish: return "轻度纠错（仅删嗯啊 · 保留原句式）"
-        case .verbatimLocal: return "纯本地直出（零云端 · 原声秒出）"
+        case .structured: return "Structured cleanup (removes fillers, fixes slips · auto paragraphs and numbered lists)"
+        case .lightPolish: return "Light cleanup (removes fillers only · keeps your wording)"
+        case .verbatimLocal: return "Verbatim (no LLM call · raw transcript, instantly)"
         }
     }
 }
 
 public enum LexiconCategory: String, CaseIterable, Codable, Identifiable, Sendable {
+    // The raw values are persisted inside the personal lexicon JSON - never rename them.
+    // Show `displayName` in the UI instead of `rawValue`.
     case person = "人名/称呼"
     case project = "项目/技术"
     case finance = "标的/商业"
@@ -282,6 +368,17 @@ public enum LexiconCategory: String, CaseIterable, Codable, Identifiable, Sendab
     case autoLearned = "纠错自学习"
 
     public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .person: return "People"
+        case .project: return "Projects & tech"
+        case .finance: return "Tickers & business"
+        case .memo: return "Notes & memos"
+        case .browser: return "Frequent sites"
+        case .autoLearned: return "Auto-learned"
+        }
+    }
 }
 
 public struct LexiconEntry: Identifiable, Codable, Hashable, Sendable {
@@ -374,6 +471,8 @@ public struct LLMConfig: Codable, Equatable {
     public var providerModels: [String: String]
     public var formattingStyle: FormattingStyle
     public var asrProvider: ASRProviderOption
+    /// Which on-device model backs the local engine (`asrProvider == .localSenseVoice`, also the cloud hot-standby).
+    public var localASRModel: LocalASRModel
     public var openAIASRBaseURL: String
     public var openAIASRModel: String
     public var enableVolcSeedASR: Bool
@@ -384,10 +483,15 @@ public struct LLMConfig: Codable, Equatable {
     public var enableWhisperAGC: Bool
     public var enableAutoLearn: Bool
     public var enableAutoMuteDuringDictation: Bool
+    /// Short start / stop sounds around each dictation (Settings -> Output). Configs saved before this existed decode as on.
+    public var enableSoundEffects: Bool
     public var showInDock: Bool
     public var speechLocale: String
     public var speechLocaleExplicitlySet: Bool
-    public var useOfficialCloudTrial: Bool
+    /// Opt-in: copy past dictations from the Typeless app into History (Settings -> Import, shown only when Typeless's
+    /// database exists). Off by default, and for every config saved before this existed. While it is off, nothing reads
+    /// the Typeless database (see `TypelessSyncCoordinator`).
+    public var enableTypelessImport: Bool
 
     public static let `default` = LLMConfig()
 
@@ -411,12 +515,15 @@ public struct LLMConfig: Codable, Equatable {
 
     public init(
         selectedProvider: LLMProviderOption? = nil,
-        baseURL: String = "https://api.deepseek.com/v1",
-        modelName: String = "deepseek-flash",
-        customBaseURL: String = "https://api.siliconflow.cn/v1",
+        // Fork defaults: cleanup runs on a local Ollama model through the "Custom" OpenAI-compatible provider.
+        baseURL: String = "http://127.0.0.1:11434/v1",
+        modelName: String = "gemma4:12b-mlx",
+        customBaseURL: String = "http://127.0.0.1:11434/v1",
         providerModels: [String: String] = [:],
         formattingStyle: FormattingStyle = .structured,
-        asrProvider: ASRProviderOption? = nil,
+        // Fork default: speech-to-text runs on the local engine (Parakeet TDT v2) instead of a cloud provider.
+        asrProvider: ASRProviderOption? = .localSenseVoice,
+        localASRModel: LocalASRModel = .default,
         openAIASRBaseURL: String = "https://api.openai.com/v1",
         openAIASRModel: String = "gpt-4o-mini-transcribe",
         enableVolcSeedASR: Bool = true,
@@ -427,10 +534,11 @@ public struct LLMConfig: Codable, Equatable {
         enableWhisperAGC: Bool = true,
         enableAutoLearn: Bool = true,
         enableAutoMuteDuringDictation: Bool = true,
+        enableSoundEffects: Bool = true,
         showInDock: Bool = false,
         speechLocale: String = "auto",
         speechLocaleExplicitlySet: Bool = false,
-        useOfficialCloudTrial: Bool = false
+        enableTypelessImport: Bool = false
     ) {
         let resolvedProvider = selectedProvider ?? LLMProviderOption.infer(from: baseURL)
         self.selectedProvider = resolvedProvider
@@ -443,6 +551,7 @@ public struct LLMConfig: Codable, Equatable {
         self.formattingStyle = formattingStyle
         let resolvedASR = asrProvider ?? (enableVolcSeedASR ? .volcSeedASR : .localSenseVoice)
         self.asrProvider = resolvedASR
+        self.localASRModel = localASRModel
         self.openAIASRBaseURL = openAIASRBaseURL
         self.openAIASRModel = openAIASRModel
         self.enableVolcSeedASR = (resolvedASR == .volcSeedASR)
@@ -453,10 +562,11 @@ public struct LLMConfig: Codable, Equatable {
         self.enableWhisperAGC = enableWhisperAGC
         self.enableAutoLearn = enableAutoLearn
         self.enableAutoMuteDuringDictation = enableAutoMuteDuringDictation
+        self.enableSoundEffects = enableSoundEffects
         self.showInDock = showInDock
         self.speechLocale = speechLocale
         self.speechLocaleExplicitlySet = speechLocaleExplicitlySet
-        self.useOfficialCloudTrial = useOfficialCloudTrial
+        self.enableTypelessImport = enableTypelessImport
     }
 
     public mutating func selectASRProvider(_ provider: ASRProviderOption) {
@@ -510,10 +620,19 @@ public struct LLMConfig: Codable, Equatable {
         self.providerModels = modelsMap
 
         self.formattingStyle = (try? c.decode(FormattingStyle.self, forKey: .formattingStyle)) ?? .structured
-        let legacyVolcFlag = (try? c.decode(Bool.self, forKey: .enableVolcSeedASR)) ?? true
-        let resolvedASR = (try? c.decode(ASRProviderOption.self, forKey: .asrProvider))
-            ?? (legacyVolcFlag ? .volcSeedASR : .localSenseVoice)
+        // A stored provider this build does not know (for example one that was removed) decodes to the default engine instead of
+        // failing; only configs that predate `asrProvider` entirely fall back on the old `enableVolcSeedASR` flag.
+        let resolvedASR: ASRProviderOption
+        if c.contains(.asrProvider) {
+            resolvedASR = (try? c.decode(ASRProviderOption.self, forKey: .asrProvider)) ?? LLMConfig.default.asrProvider
+        } else {
+            let legacyVolcFlag = (try? c.decode(Bool.self, forKey: .enableVolcSeedASR)) ?? true
+            resolvedASR = legacyVolcFlag ? .volcSeedASR : .localSenseVoice
+        }
         self.asrProvider = resolvedASR
+        // Configs saved before this setting existed fall back to the default model; if its files are missing the
+        // engine automatically uses the other installed model, so legacy SenseVoice-only machines keep working.
+        self.localASRModel = (try? c.decode(LocalASRModel.self, forKey: .localASRModel)) ?? .default
         let decodedOpenAIASRURL = (try? c.decode(String.self, forKey: .openAIASRBaseURL)) ?? "https://api.openai.com/v1"
         self.openAIASRBaseURL = decodedOpenAIASRURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "https://api.openai.com/v1" : decodedOpenAIASRURL
@@ -528,6 +647,7 @@ public struct LLMConfig: Codable, Equatable {
         self.enableWhisperAGC = (try? c.decode(Bool.self, forKey: .enableWhisperAGC)) ?? true
         self.enableAutoLearn = (try? c.decode(Bool.self, forKey: .enableAutoLearn)) ?? true
         self.enableAutoMuteDuringDictation = (try? c.decode(Bool.self, forKey: .enableAutoMuteDuringDictation)) ?? true
+        self.enableSoundEffects = (try? c.decode(Bool.self, forKey: .enableSoundEffects)) ?? true
         self.showInDock = (try? c.decode(Bool.self, forKey: .showInDock)) ?? false
         let explicitlySetLocale = (try? c.decode(Bool.self, forKey: .speechLocaleExplicitlySet)) ?? false
         let decodedLocale = ((try? c.decode(String.self, forKey: .speechLocale)) ?? "auto")
@@ -540,6 +660,6 @@ public struct LLMConfig: Codable, Equatable {
         } else {
             self.speechLocale = decodedLocale.isEmpty ? "auto" : decodedLocale
         }
-        self.useOfficialCloudTrial = (try? c.decode(Bool.self, forKey: .useOfficialCloudTrial)) ?? false
+        self.enableTypelessImport = (try? c.decode(Bool.self, forKey: .enableTypelessImport)) ?? false
     }
 }

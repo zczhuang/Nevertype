@@ -57,9 +57,7 @@ public final class PersonalLexiconStore: ObservableObject {
         if let customStorageURL {
             self.storageURL = customStorageURL
         } else {
-            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-            let dir = appSupport.appendingPathComponent("TypeZero", isDirectory: true)
+            let dir = AppBrand.applicationSupportDirectory()
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             self.storageURL = dir.appendingPathComponent("lexicon.json")
         }
@@ -81,7 +79,7 @@ public final class PersonalLexiconStore: ObservableObject {
             // Seed minimal tech examples ONLY when lexicon.json does not exist yet!
             self.entries = [
                 LexiconEntry(term: "DeepSeek", aliases: ["迪普西克", "deep seek"], category: .project, weight: 5),
-                LexiconEntry(term: "TypeZero", aliases: ["type zero", "太普零"], category: .project, weight: 5)
+                LexiconEntry(term: AppBrand.name, aliases: ["never type"], category: .project, weight: 5)
             ]
             save()
             return
@@ -99,7 +97,7 @@ public final class PersonalLexiconStore: ObservableObject {
         try? data.write(to: bakURL, options: .atomic)
         self.entries = [
             LexiconEntry(term: "DeepSeek", aliases: ["迪普西克", "deep seek"], category: .project, weight: 5),
-            LexiconEntry(term: "TypeZero", aliases: ["type zero", "太普零"], category: .project, weight: 5)
+            LexiconEntry(term: AppBrand.name, aliases: ["never type"], category: .project, weight: 5)
         ]
     }
 

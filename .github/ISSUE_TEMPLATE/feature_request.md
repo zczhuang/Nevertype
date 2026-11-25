@@ -1,12 +1,12 @@
 ---
 name: Feature Request
-about: Suggest an enhancement or new capability for TypeZero
+about: Suggest an improvement or a new capability for Nevertype
 title: "[Feature] "
 labels: enhancement
 ---
 
-## Problem / Use Case
+## Problem or use case
 Describe the dictation workflow or friction you want solved.
 
-## Proposed Solution
-Describe how you envision this working in TypeZero.
+## Proposed solution
+Describe how you would like it to work in Nevertype. If it needs a new network connection or stores new data, say so.

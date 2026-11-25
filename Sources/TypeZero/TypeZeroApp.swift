@@ -5,13 +5,28 @@ import AppKit
 enum TypeZeroMain {
     static func main() {
         if CommandLine.arguments.contains("--self-test") {
-            exit(SelfTestSuite.runAll())
+            let core = SelfTestSuite.runAll()
+            let ui = TZUISelfTests.runAll()
+            let typelessImport = TypelessImportSelfTests.runAll()
+            exit(core != 0 ? core : (ui != 0 ? ui : typelessImport))
+        }
+        // Read-only preview of "sync history from Typeless": prints row counts for the real typeless.db and writes nothing.
+        if CommandLine.arguments.contains("--typeless-import-dry-run") {
+            exit(TypelessHistoryImporter.runDryRun())
         }
         if CommandLine.arguments.contains("--bench-asr") {
             exit(SelfTestSuite.runDualASRSmokeBenchmark())
         }
         if let idx = CommandLine.arguments.firstIndex(of: "--ab-verify"), idx + 1 < CommandLine.arguments.count {
             exit(SelfTestSuite.runEmpiricalABVerification(wavPath: CommandLine.arguments[idx + 1]))
+        }
+        // Headless end-to-end test (no microphone, no GUI): Nevertype --dictate-file <path.wav> [--style ...] [--scene ...]
+        if CommandLine.arguments.contains("--dictate-file") {
+            exit(DictateFileCLI.run(arguments: Array(CommandLine.arguments.dropFirst())))
+        }
+        // Visual QA: renders every page of the main window to PNGs with sample data (see TZRenderUI): Nevertype --render-ui <output-dir>
+        if CommandLine.arguments.contains("--render-ui") {
+            exit(TZRenderUI.run(arguments: Array(CommandLine.arguments.dropFirst())))
         }
         TypeZeroApp.main()
     }
@@ -27,7 +42,7 @@ final class TypeZeroAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        // Re-opening TypeZero from Spotlight or Applications brings the main dashboard right back
+        // Re-opening the app from Spotlight or Applications brings the main dashboard right back
         Self.openMainWindowAction?()
         return true
     }
@@ -38,14 +53,18 @@ struct TypeZeroApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        Window("TypeZero", id: "main") {
+        Window(AppBrand.name, id: "main") {
             MainWindowHost(appState: appState)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 960, height: 680)
+        .defaultSize(width: 1000, height: 680)
 
-        MenuBarExtra("TypeZero", systemImage: "infinity") {
+        MenuBarExtra {
             TypeZeroMenuBarContent(appState: appState)
+        } label: {
+            Image(nsImage: NevertypeMenuBarIcon.image())
+                .renderingMode(.template)
+                .accessibilityLabel(AppBrand.name)
         }
     }
 }
@@ -56,12 +75,17 @@ private struct MainWindowHost: View {
 
     var body: some View {
         MainDashboardView(appState: appState)
+            .task {
+                // Once per launch (the coordinator ignores later calls). Lives here rather than in MainDashboardView,
+                // which `--render-ui` also hosts with sample data.
+                await TypelessSyncCoordinator.shared.syncOnLaunch(into: appState)
+            }
             .onAppear {
                 TypeZeroAppDelegate.openMainWindowAction = {
                     openWindow(id: "main")
                     DispatchQueue.main.async {
                         NSApp.activate(ignoringOtherApps: true)
-                        for window in NSApp.windows where window.identifier?.rawValue == "main" || window.title == "TypeZero" {
+                        for window in NSApp.windows where window.identifier?.rawValue == "main" || window.title == AppBrand.name {
                             window.deminiaturize(nil)
                             window.makeKeyAndOrderFront(nil)
                             window.orderFrontRegardless()
@@ -77,33 +101,25 @@ private struct TypeZeroMenuBarContent: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        if let upd = appState.availableUpdate {
-            Button("⬆️ 发现新版本 \(upd.tag) · 点击一键升级") {
-                presentMainWindow(tab: nil)
-                Task { await appState.installAvailableUpdate() }
-            }
-            Divider()
-        }
-
-        Button("打开 TypeZero 主界面") {
+        Button("Open \(AppBrand.name)") {
             presentMainWindow(tab: nil)
         }
         .keyboardShortcut(",", modifiers: [.command])
 
-        Button("引擎与快捷键设置…") {
+        Button("Settings…") {
             presentMainWindow(tab: .settings)
         }
 
-        Button("个人专属词库（\(appState.lexiconStore.entries.count) 词）…") {
+        Button("Dictionary (\(appState.lexiconStore.entries.count) \(appState.lexiconStore.entries.count == 1 ? "word" : "words"))…") {
             presentMainWindow(tab: .dictionary)
         }
 
         Divider()
 
-        Text("快捷键：\(appState.activeTriggerDisplayName)")
-        Text("今日累计：\(appState.totalCharactersDictated) 字")
+        Text("Shortcut: \(appState.tzShortcutName)")
+        Text("Words dictated: \(TZStats.formatCount(TZStats.totals(appState.history).words))")
 
-        Button("手动开始/结束试音") {
+        Button("Start / Stop Test Dictation") {
             if case .listening = appState.phase {
                 Task { await appState.finishDictationSession() }
             } else {
@@ -113,7 +129,7 @@ private struct TypeZeroMenuBarContent: View {
 
         if !appState.history.isEmpty {
             Divider()
-            Text("最近口述救生舱（点击复制）")
+            Text("Recent dictations (click to copy)")
             ForEach(appState.history.prefix(5)) { rec in
                 Button(String(rec.polishedText.replacingOccurrences(of: "\n", with: " ").prefix(26))) {
                     ContextInjector.saveToSafetyClipboard(rec.polishedText)
@@ -123,15 +139,14 @@ private struct TypeZeroMenuBarContent: View {
 
         Divider()
 
-        Toggle("在程序坞 (Dock) 显示图标", isOn: $appState.llmConfig.showInDock)
+        Toggle("Show Icon in Dock", isOn: $appState.llmConfig.showInDock)
 
-        Button(appState.isCheckingForUpdate ? "正在检查更新…" : "检查更新（当前 v\(appState.currentAppVersion)）") {
+        Button("Check for Updates… (v\(appState.currentAppVersion))") {
             presentMainWindow(tab: nil)
             Task { await appState.checkForUpdates(manual: true) }
         }
-        .disabled(appState.isCheckingForUpdate || appState.isInstallingUpdate)
 
-        Button("退出 TypeZero") {
+        Button("Quit \(AppBrand.name)") {
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q")
@@ -152,7 +167,7 @@ private struct TypeZeroMenuBarContent: View {
         openWindow(id: "main")
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
-            for window in NSApp.windows where window.identifier?.rawValue == "main" || window.title == "TypeZero" {
+            for window in NSApp.windows where window.identifier?.rawValue == "main" || window.title == AppBrand.name {
                 window.deminiaturize(nil)
                 window.makeKeyAndOrderFront(nil)
                 window.orderFrontRegardless()

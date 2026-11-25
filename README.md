@@ -1,116 +1,154 @@
-# TypeZero — The Best Free & Open-Source AI Voice Input App (macOS & Windows)
+# Nevertype
 
-> **Speak. Ship.** — Ultra-low-latency native **macOS (Swift + C++) & Windows 10/11 (Rust + Win32 + Tauri v2)** AI voice dictation & Typeless-grade text structuring. MIT open source, BYOK zero-subscription, `121ms` latency, 100% local privacy.
+Voice typing for macOS that runs on your Mac. Hold or tap a key, speak, and cleaned-up text is typed where your cursor is, in any app.
 
-[![macOS Release](https://img.shields.io/badge/macOS-v0.4.10%20%7C%20Apple%20Silicon-17161B?style=flat-square)](https://github.com/nasadunadu/TypeZero/releases/tag/v0.4.10)
-[![Windows Release](https://img.shields.io/badge/Windows-v0.5.0%20%7C%20Win10%2F11%20x64-0078D4?style=flat-square)](https://github.com/nasadunadu/TypeZero/releases/tag/v0.5.0-windows)
-[![Notarized](https://img.shields.io/badge/Gatekeeper-Apple%20Notarized%20%C2%B7%20Developer%20ID-14804A?style=flat-square)](https://github.com/nasadunadu/TypeZero/releases/latest)
-[![ASR](https://img.shields.io/badge/ASR-Seed--ASR%202.0%20%2B%20SenseVoice%20FP32-14804A?style=flat-square)](#dual-engine-architecture)
-[![Privacy](https://img.shields.io/badge/Security-BYOK%20%C2%B7%20Keychain%20%2F%20CredMan-5A46E8?style=flat-square)](./SECURITY.md)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+Nevertype is a fork of [TypeZero](https://github.com/nasadunadu/TypeZero) v0.5.8 by nasadunadu, released under the MIT license. By default, speech recognition runs on the Mac and text cleanup uses a local model through Ollama. There is no account, no telemetry and no automatic update check.
 
-**English** · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md) · [한국어](./README.ko.md) · [Français](./README.fr.md)
+- Version 0.1.0
+- Apple Silicon, macOS 14 or later
+- [MIT license](LICENSE)
 
-[**Download macOS DMG (v0.4.10)**](https://github.com/nasadunadu/TypeZero/releases/download/v0.4.10/TypeZero-v0.4.10-macOS-arm64.dmg) · [**Download Windows Setup .exe (v0.5.0)**](https://github.com/nasadunadu/TypeZero/releases/download/v0.5.0-windows/TypeZero-v0.5.0-Windows-x64-setup.exe) · [**Windows Portable .zip**](https://github.com/nasadunadu/TypeZero/releases/download/v0.5.0-windows/TypeZero-v0.5.0-Windows-x64-portable.zip) · [Architecture Log](./docs/STATUS_LOG.md)
+## How it works
 
-![TypeZero Hero Showcase](./docs/images/hero-showcase-en.svg)
+1. **Press your shortcut.** The default is the Fn (Globe) key. Tap it once to start and again to stop. In Settings you can switch to hold-to-talk, or pick another key: Left or Right Option, Command, Control or Shift, Option + Space, or a combination you record yourself. Esc cancels a recording.
+2. **Speak.** A small pill near the text field shows a waveform while you talk. By default, Nevertype mutes your speakers while you record and restores the volume when you stop.
+3. **Speech to text.** NVIDIA Parakeet TDT 0.6B v2 turns your speech into text on the Mac, through sherpa-onnx.
+4. **Cleanup.** The pill shows "Thinking" while a language model tidies the transcript. It removes filler words and false starts. When you correct yourself, it keeps only the final wording. It fixes misheard words with help from your dictionary, adds punctuation, and starts new paragraphs or numbered lists where your speech calls for them. By default the model is `gemma4:12b-mlx`, running in Ollama on your Mac. Short phrases that already read well (under about 28 characters) skip this step.
+5. **Typing.** The text is typed into the app you are using. By default the words appear as you speak and are replaced by the cleaned-up text when you stop. A setting changes this to a single paste when you finish. If no text field has focus, the text is copied to the clipboard instead, and the pill says so.
 
----
+If the cleanup model cannot be reached, Nevertype inserts the raw transcript and shows a warning.
 
-## Install in 10 Seconds
+### Rewrite selection
 
-### Direct Download (Recommended)
-1. Download [**`TypeZero-v0.4.10-macOS-arm64.dmg`**](https://github.com/nasadunadu/TypeZero/releases/latest/download/TypeZero-v0.4.10-macOS-arm64.dmg) and drag **`TypeZero.app`** into **`Applications`**.
-2. Open **TypeZero** — the built-in 3-step onboarding wizard guides you through Microphone & Accessibility permissions, API keys (stored solely in your macOS Keychain), and your preferred global hotkey.
+Select some text, then start dictating. Your speech is treated as an instruction for that text, for example "make this shorter" or "change Tuesday to Wednesday". The result replaces the selection.
 
-### Homebrew Cask (macOS)
-```bash
-brew tap nasadunadu/typezero https://github.com/nasadunadu/TypeZero
-brew install --cask typezero
-```
+### Formatting styles
 
-### Windows 10 / 11 (x64)
-1. Download [**`TypeZero-v0.5.0-Windows-x64-setup.exe`**](https://github.com/nasadunadu/TypeZero/releases/download/v0.5.0-windows/TypeZero-v0.5.0-Windows-x64-setup.exe) (per-user installer, no Admin UAC prompt) or the [**Portable `.zip`**](https://github.com/nasadunadu/TypeZero/releases/download/v0.5.0-windows/TypeZero-v0.5.0-Windows-x64-portable.zip).
-2. If Windows SmartScreen appears on first launch (unsigned open-source build), click **More info → Run anyway**. Default trigger key is **`Right Alt`** (with Alt menu-bar focus suppression), credentials are encrypted in Windows Credential Manager, and it works across WeChat, Feishu, Word, Chrome, VS Code, and Windows Terminal. See [windows/README.md](./windows/README.md).
+Settings → Output → Formatting style:
 
----
+- **Structured** (default). Fixes grammar and organizes what you said into paragraphs and numbered lists.
+- **Light.** Removes filler words and fixes typos, but keeps your sentences as spoken.
+- **Verbatim.** Calls no cleanup model. Your words are inserted as transcribed, with dictionary fixes only.
 
-## Why TypeZero?
+### The app window
 
-Most voice dictation apps lock you into \$10–\$15/month word-capped subscriptions, introduce `1.5s–3.0s` upload lag, or lose your personal names and technical acronyms.
+Nevertype lives in the menu bar. Its window has four pages:
 
-**TypeZero** brings Typeless-level intelligence and Doubao-grade responsiveness to an **open-source, MIT-licensed, zero-subscription** native macOS app:
+- **Home.** Totals for words dictated, time saved, average speed and dictation time, a calendar of your activity, the apps you dictate into most, and a box where you can try dictation.
+- **History.** Your latest 1,000 dictations, with the raw transcript available for each one. They are kept on your Mac.
+- **Dictionary.** Names and terms you say often, plus the forms they are often misheard as. Add them by hand, import them from pasted text, a notes folder or your browser's page titles (see [Privacy](#privacy)), or let Nevertype learn from the corrections you make.
+- **Settings.** Speech model, cleanup model, shortcut, output options and permissions.
 
-- **Tri-Engine Acoustic Recognition (Volcengine Seed-ASR 2.0 · OpenAI / Groq Cloud Speech · `0`-Drop Offline Failover)**: Choose between native binary WebSocket streaming (**Volcengine Seed-ASR 2.0**, `121ms` tail), **OpenAI (`gpt-4o-mini-transcribe` / `gpt-4o-transcribe`) & Groq (`whisper-large-v3-turbo`)** cloud speech APIs (auto-reusing your OpenAI key with personal lexicon prompt injection), or pure offline C++ **`sherpa-onnx` 886MB SenseVoice FP32** — with automatic zero-dropped-syllable local failover when offline.
-- **Live Inline Typewriter (Default) + Optional Zero-Flicker Capsule Mode**: By default, streams words directly into your focused text field at `11ms–18ms` latency with live `<=6`-char self-correction. Prefer keeping the input box untouched until release? Flip one toggle for Capsule Mode, which displays rhythmic micro-symbols (`• · ✦`) and character count above the 120Hz sine-wave capsule and lands the final structured text atomically in **`~8ms`** via clipboard-preserving paste.
-- **Smart `<=28`-Char Clean Cloud Bypass (`0ms` Pass-2)**: Clean punctuated single sentences (`<= 28` chars) without fillers, self-corrections, or list cues paste immediately after speech ends without waiting for an LLM round-trip.
-- **Typeless 5-Pillar Semantic Formatting**: Removes fillers (`嗯/啊/那个`) and mid-sentence self-corrections, auto-routes numbered (`1. 2. 3.`) vs bulleted (`- `) lists, splits long monologues into crisp paragraphs, applies CJK-Latin Pangu spacing & Arabic numeral ITN, and prevents Markdown auto-list `2. 2.` duplication in Cursor / Notion / Feishu.
-- **Full Left & Right Shortcuts + Custom Combo Recorder**: Native hardware keyCode & IOKit left/right isolation for **`Fn`**, **Left/Right `Option ⌥`**, **Left/Right `Command ⌘`**, **Left/Right `Control ⌃`**, **Left/Right `Shift ⇧`**, **`⌥ + Space`**, plus a 1-click **Custom Hotkey Recorder** backed by Carbon `RegisterEventHotKey` (zero leaked characters into editors, plus 140ms hold-to-talk combo protection so `⌘+C` / `⇧+A` never false-trigger).
-- **Unified Check-to-Activate Engine & Key Panel**: Speech models and formatting LLMs (**OpenAI GPT**, **Google Gemini**, **Anthropic Claude**, **DeepSeek 4 Flash**, **Volcengine Doubao-Seed**, **Alibaba Qwen-Flash**, or **Custom OpenAI / Local Ollama & LM Studio**) keep their API keys, model IDs, and live latency probes right inside each checkable card — check a model and it immediately takes effect.
-- **Self-Evolving Personal Lexicon (`<0.5ms` Fuzzy Phonetic Recall)**: Tone-free accent-tolerant phonetic skeleton (`zh/z`, `sh/s`, `ing/in`, `n/l`), word-boundary acronym glide fixes (`Su` -> `SEO` without touching `Summary`/`Supabase`), multi-paragraph manual-edit auto-learning via Apple `NLTokenizer`, and selected-text voice rewrite teach-in.
+## Requirements
 
----
+- A Mac with Apple Silicon (M1 or later) running macOS 14 (Sonoma) or later.
+- Microphone and Accessibility permission. Accessibility lets Nevertype type into other apps and read the text field you are using.
+- About 480 MB of free disk space for the default speech model, and about 890 MB more if you add SenseVoice.
+- For the default cleanup setup: [Ollama](https://ollama.com) and the `gemma4:12b-mlx` model.
+- To build from source: Xcode 16 or later, or the matching Command Line Tools (Swift 6.0 or later).
 
-## Competitor Comparison Matrix
+## Setup
 
-| Capability | macOS Built-in Dictation | Freemium (`闪电说`) | Subscription (`Typeless` / `Wispr Flow`) | **TypeZero (MIT Open Source)** |
-| :--- | :--- | :--- | :--- | :--- |
-| **Pricing & Quota** | Free | Free tier + Paid plans | \$10–\$15/mo (word cap on free) | **100% Free · Unlimited · MIT License** |
-| **Acoustic Engine** | Apple Dictation | Local / Cloud | Cloud batch upload | **Seed-ASR 2.0 / OpenAI & Groq ASR + 886MB FP32 Failover** |
-| **Formatting & De-Rambling** | None (literal typos) | Yes | Yes (5-pillar structuring) | **Yes (OpenAI / Gemini / Claude / DeepSeek / Doubao / Qwen / Ollama BYOK)** |
-| **Short-Sentence Latency** | Fast, no formatting | `300–600ms` | `700–1500ms` | **`0ms` Pass-2 Bypass (`<=28` chars) · `~8ms` Paste** |
-| **Shortcuts (Left & Right)** | System preset only | Left/Right + Combos | Limited presets | **All Left/Right Modifiers + Custom Carbon Combos** |
-| **Personal Lexicon & Learning** | None | Manual list + auto-learn | Cloud-synced auto-learn | **`<0.5ms` Local Fuzzy Phonetic + 3-Way Auto-Learn** |
-| **Privacy & Credential Storage** | Apple | Vendor / Local | Vendor Cloud | **BYOK · macOS Keychain (`SecItem`) · Optional 100% Offline** |
+1. **Get the app.** Build it from source. See [Building](#building).
+2. **Install Ollama** from [ollama.com](https://ollama.com) and start it.
+3. **Pull the cleanup model.**
 
----
+   ```bash
+   ollama pull gemma4:12b-mlx
+   ```
 
-## Dual-Engine Architecture
+   Nevertype sends cleanup requests to Ollama at `http://127.0.0.1:11434/v1`. It turns the model's thinking mode off. It also asks Ollama to keep the model loaded, so the first dictation after a pause is not slow. Ollama then holds the model in memory until Ollama quits.
+4. **Open Nevertype.** The setup guide has three steps: grant Microphone and Accessibility permission, choose your speech and cleanup engines, and pick a shortcut and download the speech model. The speech model (about 480 MB) comes from the sherpa-onnx release on GitHub and is checked against a pinned SHA-256 checksum.
+5. **Try it.** Click into any text field, press the shortcut, speak, and press it again.
 
-```text
-Mic Audio (CoreAudio AVAudioConverter Polyphase 48kHz -> 16kHz Int16 + 25dB Whisper AGC)
-  ├── Primary: Volcengine Seed-ASR 2.0 Binary WebSocket (Direct, Top-65 Context Hotwords, ~121ms tail)
-  └── Standby: Embedded C++ sherpa-onnx SenseVoice FP32 (886MB lossless, 0-drop auto failover)
-          │
-          ▼
-  Pass 1 (<0.5ms): Instant Personal Lexicon + Word-Boundary Acronym Glide + <=28-Char Clean Bypass Check
-          │
-          ▼ (if complex / rambling / list / homophone candidate)
-  Pass 2 (~210ms TTFT): Checked LLM (DeepSeek 4 Flash / Doubao-Seed / Qwen-Flash / Custom / Ollama) SSE
-          │
-          ▼
-  Atomic Cursor Injection (~8ms Clipboard-Preserving Paste or Optional 11ms Live Inline Typewriter)
-          │
-          ▼
-  Passive Self-Learning Loop (Manual Edit Diff via NLTokenizer + Selected-Text Voice Teach-In)
-```
+**Other cleanup models.** In Settings → Cleanup model, you can point Nevertype at any OpenAI-compatible endpoint, such as another local server or SiliconFlow. You can also choose a cloud provider and add your own API key: OpenAI, Anthropic, Gemini, DeepSeek, Volcengine or DashScope. Keys are stored in the macOS Keychain.
 
----
+**Other languages.** The default speech model is English only. For Chinese, English, Japanese, Korean or Cantonese, download SenseVoice (about 890 MB) in Settings → Speech recognition. The cleanup instructions are written for English.
 
-## Build from Source
+### Troubleshooting
 
-Requires macOS 14.0+ on Apple Silicon (`arm64`) and Xcode Command Line Tools (`swift` >= 5.10).
+- **The Fn (Globe) key opens the emoji picker or another macOS action.** In System Settings → Keyboard, set the Globe key action to Do Nothing. Or pick a different shortcut in Nevertype.
+- **Nothing is typed.** Check that Nevertype is switched on in System Settings → Privacy & Security → Accessibility. A build with an ad hoc signature looks like a new app to macOS after every rebuild. In Nevertype, Settings → Permissions → Reset Accessibility cache clears the old entry.
+- **You get the raw transcript and a warning.** The cleanup model could not be reached. Check that Ollama is running and that you pulled the model.
+
+## Building
 
 ```bash
-git clone https://github.com/nasadunadu/TypeZero.git
-cd TypeZero
-
-# 1. Fetch sherpa-onnx macOS arm64 shared C runtime
-./scripts/setup-vendor.sh
-
-# 2. Run 40 deterministic core regression assertions (0 compiler warnings)
-./scripts/run-tests.sh
-
-# 3. Build TypeZero.app (auto-signs with Developer ID if installed, else ad-hoc)
+git clone https://github.com/zczhuang/Nevertype.git
+cd Nevertype
 ./scripts/build-app.sh
-open ./build/TypeZero.app
-
-# 4. (Optional) Build distributable DMG installer
-./scripts/package-dmg.sh
+open build/Nevertype.app
 ```
 
----
+`scripts/build-app.sh`:
+
+- fetches the sherpa-onnx runtime into `Vendor/` if it is not there yet, and checks it against a pinned SHA-256 checksum;
+- builds a release binary with Swift Package Manager;
+- assembles `build/Nevertype.app`, with the sherpa-onnx and ONNX Runtime libraries inside, and the license texts in `Contents/Resources/Licenses`;
+- signs the app with an Apple Development (or Developer ID) identity if one is in your keychain, and ad hoc otherwise.
+
+`Vendor/` and `build/` are not committed. The build does not download a speech model. The app does that itself.
+
+To run the tests:
+
+```bash
+./scripts/run-tests.sh
+```
+
+This builds a release binary and runs it with `--self-test`. That runs the built-in test suites: core logic (dictionary matching, cleanup rules, settings, model download), the interface helpers and the Typeless import. The tests use temporary files and fixtures. They need no microphone and no running Ollama. They do need the sherpa-onnx runtime in `Vendor/`. If you have not built the app yet, fetch it first with `./scripts/setup-vendor.sh`.
+
+## Privacy
+
+Audio and text stay on your Mac unless you choose a cloud provider.
+
+- **Speech.** The speech model runs on your Mac, and Nevertype does not save recordings. Until a speech model is installed, dictation uses macOS's own on-device speech recognition, which also stays on your Mac. Nevertype asks macOS for on-device recognition only. If macOS cannot do that for your language, dictation stops with a message to download a speech model in Settings. It never switches to server recognition.
+- **Cleanup.** The transcript goes to the cleanup endpoint you configure. The default is Ollama on `127.0.0.1`, which is your own Mac. A cleanup request contains the transcript, a label for the kind of app you are typing in (chat, email, terminal or notes), a short excerpt of the text before your cursor, the end of your last two dictations, and some of your dictionary entries: the ones that match what you said or the title of the window you are in, your always-prioritized words, and your highest-priority entries when few match. For Rewrite selection it contains the selected text and your spoken instruction instead of the excerpt. If you import dictionary words from pasted text with the cleanup model, that text goes to the endpoint too.
+- **Cloud providers.** They are optional. If you add a key and choose a provider, the data for that feature goes to it: the cleanup request for a cleanup provider, or your audio for a cloud speech engine (OpenAI, Groq or Volcengine), together with a short list of your highest-ranked dictionary terms as recognition hints. The provider's terms apply. Your key is stored in the macOS Keychain.
+- **Dictionary imports.** Each one runs only when you choose it from the menu on the Dictionary page. Importing from a notes folder reads the `.md`, `.txt` and `.csv` files in the folder you pick (up to 400) on your Mac, and keeps up to 120 names and terms that repeat, not the text. Pasting text with "Extract with AI" is the import described under Cleanup. Learning from browser history is described next.
+- **Browser history.** "Learn terms from browser history" never runs by itself. It uses the first history file it finds, in this order: Chrome (Default profile), Arc (Default profile), Safari. It copies that file to a temporary file, reads only the page titles from the copy (up to 500: the pages you visited at least twice, most visited first, in Chrome and Arc, or the most recent visits in Safari), and deletes the copy. From the titles it keeps up to 60 words and short phrases that appear in at least two of them, skipping a short list of generic site names, and adds them to your dictionary under "Frequent sites". Titles and URLs are not stored. The import itself sends nothing anywhere. The added terms are ordinary dictionary entries in `lexicon.json`: you can delete them on the Dictionary page, and, like any entry, a term can go to the cleanup endpoint when it matches what you say, or to a cloud speech engine as a hint. macOS may block access to Safari's history, and Nevertype does not ask for Full Disk Access.
+- **Network.** Apart from the cleanup endpoint and any cloud provider you set up, the only connection Nevertype makes is the speech model download from GitHub. There is no account, no telemetry and no automatic update check. New versions are published on the project's [Releases](https://github.com/zczhuang/Nevertype/releases) page.
+- **On disk.** Your history (the latest 1,000 dictations), dictionary, settings and downloaded speech models live in `~/Library/Application Support/Nevertype`. They are plain files. A small debug log, `injection-trace.log`, records app bundle IDs and text lengths, never your text. Delete the folder to remove everything, or use Clear history on the History page. API keys are in the Keychain, not in that folder.
+- **Clipboard.** To paste text, Nevertype copies it to the clipboard and then restores what was there before. If no text field has focus, the text stays on the clipboard so you can paste it yourself.
+- **Permissions.** Microphone, to hear you. Accessibility, to type into other apps and to read the focused text field: the selected text, the text before your cursor and, if "Learn from my corrections" is on, the fixes you make right after dictating. Speech Recognition, only when no speech model is installed and dictation uses macOS's recognizer.
+
+## Importing from Typeless
+
+If Typeless is installed on this Mac, Nevertype can copy your past dictations into its History. This is off until you turn it on.
+
+- **Turning it on.** When `~/Library/Application Support/Typeless/typeless.db` exists, Settings shows **Import history from Typeless** in an Import section. Turning it on imports your past dictations right away. After that, Nevertype checks for new ones when it starts and when you open History, and the menu on the History page gets **Sync from Typeless** for a manual sync. Turning it off stops all of this.
+- **While it is off,** Nevertype does not open the Typeless database. It only checks that the file exists, to decide whether to show the switch.
+- It reads the database read-only and never writes to it. If the database cannot be opened read-only, for example because it is locked, Nevertype reads a temporary copy and deletes the copy afterwards.
+- Only finished voice dictations that have text are imported: the text, the length of the recording and the date.
+- Each dictation is imported once. If you delete an imported dictation in Nevertype, it does not come back.
+- Imported entries show "Typeless" as their app in History.
+
+## Differences from TypeZero
+
+- Speech recognition and cleanup default to local models (Parakeet and Ollama).
+- The interface and the cleanup instructions are in English.
+- It can import your dictation history from Typeless, if you turn that on.
+- There is no account or sign-in, and no update check. The Windows app, the website and the cloud backend of the original project are not part of this repository.
+
+## Credits
+
+Nevertype builds on the work of others. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists the licenses.
+
+- [TypeZero](https://github.com/nasadunadu/TypeZero) by nasadunadu (MIT). Nevertype is a fork of v0.5.8.
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0). Runs the speech models.
+- [ONNX Runtime](https://onnxruntime.ai) (MIT). Bundled inside the sherpa-onnx libraries.
+- [NVIDIA Parakeet TDT 0.6B v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) (CC-BY-4.0). The default speech model.
+- [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) (under its own model license). The optional multilingual speech model.
+
+The speech models are downloaded by the app from the sherpa-onnx release. The cleanup model is pulled by you through Ollama under its own terms. Nevertype does not distribute any of them.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). To report a vulnerability, use GitHub's private vulnerability reporting. See [SECURITY.md](SECURITY.md).
 
 ## License
 
-Released under the [MIT License](./LICENSE).
+Nevertype is released under the [MIT License](LICENSE). The license keeps the original TypeZero copyright line and adds Nevertype's.
+
+## Disclaimer
+
+Nevertype is an independent project. It is not affiliated with or endorsed by the TypeZero authors or by Typeless.

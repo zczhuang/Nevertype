@@ -2,20 +2,10 @@ import Foundation
 import Security
 
 public enum KeychainHelper {
-    private static let service = "io.github.typezero.macos"
+    private static let service = AppBrand.bundleID
     private static let legacyAccount = "llm_api_key"
     private static let volcSpeechAccount = "volc_speech_api_key"
-    private static let doubaoVoucherAccount = "doubao_asr_voucher_code"
     private static let openAIASRAccount = "openai_asr_api_key"
-    private static let cloudJWTAccount = "typezero_cloud_jwt"
-
-    public static func saveCloudJWT(_ token: String) {
-        saveAPIKeyInSlot(token, slot: cloudJWTAccount)
-    }
-
-    public static func loadCloudJWT() -> String {
-        return readSlot(cloudJWTAccount) ?? ""
-    }
 
     public static func saveVolcSpeechAPIKey(_ key: String) {
         let cleaned = key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -36,45 +26,9 @@ public enum KeychainHelper {
         return readSlot(volcSpeechAccount) ?? ""
     }
 
-    public static func saveDoubaoVoucherCode(_ code: String) {
-        let cleaned = code.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-            .uppercased()
-        deleteSlot(doubaoVoucherAccount)
-        guard !cleaned.isEmpty, let data = cleaned.data(using: .utf8) else { return }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: doubaoVoucherAccount,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-        ]
-        SecItemAdd(query as CFDictionary, nil)
-    }
-
-    public static func loadDoubaoVoucherCode() -> String {
-        return readSlot(doubaoVoucherAccount) ?? ""
-    }
-
+    /// True when the user has saved their own Doubao speech API key.
     public static var hasAnyDoubaoCredential: Bool {
         !loadVolcSpeechAPIKey().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !loadDoubaoVoucherCode().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// Resolves the effective Doubao Seed-ASR credential:
-    /// 1. If a voucher code is saved and NOT known exhausted/revoked, consume the gifted voucher first.
-    /// 2. As soon as the voucher is exhausted/revoked (or not configured), automatically fall over to the user's own Doubao API Key.
-    /// 3. If only an exhausted voucher exists (no own key), return the voucher so the relay surfaces the exact exhaustion prompt.
-    public static func loadEffectiveDoubaoSpeechCredential(voucherExhaustedOrRevoked: Bool) -> String {
-        let own = loadVolcSpeechAPIKey().trimmingCharacters(in: .whitespacesAndNewlines)
-        let voucher = loadDoubaoVoucherCode().trimmingCharacters(in: .whitespacesAndNewlines)
-        if !voucher.isEmpty && !voucherExhaustedOrRevoked {
-            return voucher
-        }
-        if !own.isEmpty {
-            return own
-        }
-        return voucher
     }
 
     public static func saveOpenAIASRAPIKey(_ key: String) {
@@ -131,7 +85,7 @@ public enum KeychainHelper {
     }
 
     public static func loadAPIKey(for provider: LLMProviderOption) -> String {
-        if let envKey = ProcessInfo.processInfo.environment["TYPEZERO_API_KEY"], !envKey.isEmpty {
+        if let envKey = ProcessInfo.processInfo.environment["NEVERTYPE_API_KEY"], !envKey.isEmpty {
             return envKey
         }
         let slot = providerSlot(for: provider)

@@ -19,13 +19,13 @@ public final class AppState: ObservableObject {
                 lastOpenAIASRProbeSummary = ""
                 asrEngine.prewarmCloudSocketIfReady()
             }
-            if oldValue.speechLocale != llmConfig.speechLocale {
+            if oldValue.speechLocale != llmConfig.speechLocale || oldValue.localASRModel != llmConfig.localASRModel {
                 asrEngine.reloadSenseVoiceModelAsync()
             }
             if oldValue.selectedProvider != llmConfig.selectedProvider {
                 apiKeyInput = KeychainHelper.loadAPIKey(for: llmConfig.selectedProvider)
                 lastBenchmarkSummary = ""
-                polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput)
+                polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput, model: llmConfig.modelName)
             }
             if oldValue.showInDock != llmConfig.showInDock {
                 applyDockVisibilityPolicy()
@@ -57,14 +57,21 @@ public final class AppState: ObservableObject {
     }
     @Published public var apiKeyInput: String = ""
     @Published public var volcSpeechKeyInput: String = ""
-    @Published public var doubaoVoucherInput: String = ""
     @Published public var openAIASRKeyInput: String = ""
     @Published public var savedProviderKeyFlags: [LLMProviderOption: Bool] = [:]
     @Published public var micAuthorized: Bool = false
     @Published public var speechAuthorized: Bool = false
     @Published public var accessibilityGranted: Bool = false
+    /// True when ANY local model (Parakeet or SenseVoice) is loaded — legacy name kept to avoid churn in the UI layer.
     @Published public var senseVoiceLoaded: Bool = false
+    /// True only when the lossless SenseVoice FP32 weights are the loaded model.
     @Published public var senseVoiceFullFP32: Bool = false
+    /// The local model currently loaded in the engine (can differ from `llmConfig.localASRModel` when the selected one is not installed).
+    @Published public var activeLocalModel: LocalASRModel? = nil
+    /// Local models whose files are fully present on disk.
+    @Published public var installedLocalModels: Set<LocalASRModel> = []
+    /// The model currently being downloaded, if any.
+    @Published public var downloadingLocalModel: LocalASRModel? = nil
     @Published public var statusBanner: String = ""
     @Published public var sandboxText: String = ""
     @Published public var isBenchmarkingLLM: Bool = false
@@ -83,80 +90,17 @@ public final class AppState: ObservableObject {
     @Published public var offlineDownloadProgress: Double = 0.0
     @Published public var offlineDownloadStatusText: String = ""
 
-    // TypeZero Cloud Auth & Official Free Trial + Doubao ASR Voucher
-    @Published public var cloudUser: CloudUserProfile? = nil
-    @Published public var cloudCapabilities: CloudCapabilities? = nil
-    @Published public var voucherProfile: CloudVoucherProfile? = nil
-    @Published public var cloudEmailInput: String = ""
-    @Published public var cloudCodeInput: String = ""
-    @Published public var cloudCodeSent: Bool = false
-    @Published public var isCloudAuthBusy: Bool = false
-    @Published public var isWaitingGoogleOAuth: Bool = false
-    @Published public var cloudAuthMessage: String = ""
-    private var googlePollTask: Task<Void, Never>? = nil
+    private var idleResetTask: Task<Void, Never>? = nil
+    private var pendingAutoMuteTask: Task<Void, Never>? = nil
 
+    /// True when the user has typed or saved their own Doubao speech API key.
     public var hasOwnVolcSpeechKey: Bool {
         !volcSpeechKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    public var hasDoubaoVoucher: Bool {
-        CloudAuthClient.isVoucherCode(doubaoVoucherInput)
-    }
-
-    public var isDoubaoVoucherExhaustedOrRevoked: Bool {
-        guard let vp = voucherProfile else { return false }
-        return vp.exhausted || vp.revoked
-    }
-
-    public var hasAnyVolcSpeechCredential: Bool {
-        hasOwnVolcSpeechKey || hasDoubaoVoucher
-    }
-
-    /// Priority rule:
-    /// - If an active (non-exhausted, non-revoked) voucher exists, consume the gifted voucher quota first.
-    /// - Once the voucher is exhausted/revoked (or removed), seamlessly auto-switch to the user's own Doubao API Key.
-    public var effectiveDoubaoSpeechCredential: String {
-        let own = volcSpeechKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        let voucher = CloudAuthClient.isVoucherCode(doubaoVoucherInput)
-            ? CloudAuthClient.normalizedVoucherCode(doubaoVoucherInput)
-            : ""
-        if !voucher.isEmpty && !isDoubaoVoucherExhaustedOrRevoked {
-            return voucher
-        }
-        if !own.isEmpty {
-            return own
-        }
-        return voucher
-    }
-
-    public var isUsingDoubaoVoucher: Bool {
-        CloudAuthClient.isVoucherCode(effectiveDoubaoSpeechCredential)
-    }
-
-    // In-App Auto-Update
-    @Published public var availableUpdate: AppVersionManifest? = nil
-    @Published public var isCheckingForUpdate: Bool = false
-    @Published public var isInstallingUpdate: Bool = false
-    @Published public var updateDownloadProgress: Double = 0.0
-    @Published public var updateStatusText: String = ""
-    @Published public var skippedUpdateVersion: String = UserDefaults.standard.string(forKey: "tz_skipped_update_version") ?? ""
-    private var updateCheckTimer: Timer? = nil
-
+    /// Updates are off (see `AppUpdater`); only the version is shown.
     public var currentAppVersion: String {
         AppUpdater.currentAppVersion
-    }
-
-    public var shouldShowUpdateBanner: Bool {
-        guard let upd = availableUpdate else { return false }
-        return isInstallingUpdate || upd.version != skippedUpdateVersion
-    }
-
-    public var isOfficialCloudTrialActive: Bool {
-        guard llmConfig.useOfficialCloudTrial else { return false }
-        let token = KeychainHelper.loadCloudJWT().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return false }
-        if let u = cloudUser, u.balanceCny <= 0 || u.isBanned { return false }
-        return true
     }
 
     public let lexiconStore = PersonalLexiconStore()
@@ -182,9 +126,7 @@ public final class AppState: ObservableObject {
     private let configURL: URL
 
     public init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-        let dir = appSupport.appendingPathComponent("TypeZero", isDirectory: true)
+        let dir = AppBrand.applicationSupportDirectory()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.historyURL = dir.appendingPathComponent("history.json")
         self.configURL = dir.appendingPathComponent("config.json")
@@ -192,15 +134,7 @@ public final class AppState: ObservableObject {
         loadConfig()
         loadHistory()
         self.apiKeyInput = KeychainHelper.loadAPIKey(for: llmConfig.selectedProvider)
-        let rawVolcSlot = KeychainHelper.loadVolcSpeechAPIKey()
-        if CloudAuthClient.isVoucherCode(rawVolcSlot) {
-            // Auto-migrate legacy voucher stored inside API Key slot into dedicated voucher slot
-            let migratedCode = CloudAuthClient.normalizedVoucherCode(rawVolcSlot)
-            KeychainHelper.saveDoubaoVoucherCode(migratedCode)
-            KeychainHelper.saveVolcSpeechAPIKey("")
-        }
         self.volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
-        self.doubaoVoucherInput = KeychainHelper.loadDoubaoVoucherCode()
         self.openAIASRKeyInput = KeychainHelper.loadOpenAIASROverrideKey()
         refreshSavedKeyFlags()
         syncASREngineConfig()
@@ -230,17 +164,11 @@ public final class AppState: ObservableObject {
             guard let self else { return }
             self.applyDockVisibilityPolicy()
             self.pillController.attach(appState: self)
+            Self.preloadCueSounds()
             self.asrEngine.warmUp(localeIdentifier: self.llmConfig.speechLocale)
-            self.polishEngine.prewarmConnection(baseURL: self.llmConfig.baseURL)
+            self.polishEngine.prewarmConnection(baseURL: self.llmConfig.baseURL, model: self.llmConfig.modelName)
             self.hotkeyMonitor.start()
             self.startPermissionWatcher()
-            Task { [weak self] in
-                await self?.refreshCloudAccount()
-                await self?.refreshVoucherStatusIfApplicable(notifyUserOnLowOrExhausted: true)
-                try? await Task.sleep(nanoseconds: 3_500_000_000)
-                await self?.checkForUpdates(manual: false)
-            }
-            self.startPeriodicUpdateChecker()
             self.workspaceActivateObserver = NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification,
                 object: nil,
@@ -272,9 +200,9 @@ public final class AppState: ObservableObject {
             // First-run colleague onboarding check:
             // Auto-complete silently on already-configured machines; open 3-step setup guide on a brand-new colleague's Mac!
             if !UserDefaults.standard.bool(forKey: "tz_onboarding_done_v1") {
-                let hasAnyASRReady = self.hasAnyVolcSpeechCredential
+                let hasAnyASRReady = self.hasOwnVolcSpeechKey
                     || self.hasEffectiveOpenAIASRKey
-                    || StreamingASREngine.senseVoiceModelPaths() != nil
+                    || LocalASRModel.anyInstalled()
                 if self.micAuthorized && self.accessibilityGranted && hasAnyASRReady {
                     UserDefaults.standard.set(true, forKey: "tz_onboarding_done_v1")
                 } else {
@@ -284,81 +212,11 @@ public final class AppState: ObservableObject {
         }
     }
 
-    private func startPeriodicUpdateChecker() {
-        updateCheckTimer?.invalidate()
-        updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 4 * 3600, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                await self?.checkForUpdates(manual: false)
-            }
-        }
-    }
-
+    /// There is no updater: nothing is downloaded or installed and no request is made. A manual check only says where new
+    /// versions are published (see `AppUpdater.manualCheckMessage`).
     public func checkForUpdates(manual: Bool) async {
-        guard !isCheckingForUpdate, !isInstallingUpdate else { return }
-        isCheckingForUpdate = true
-        if manual {
-            updateStatusText = "正在检查最新版本…"
-        }
-        defer { isCheckingForUpdate = false }
-
-        do {
-            let manifest = try await AppUpdater.fetchLatestManifest(forceRefresh: manual)
-            if AppUpdater.isNewerVersion(manifest.version, than: currentAppVersion) {
-                availableUpdate = manifest
-                if manual {
-                    skippedUpdateVersion = ""
-                    UserDefaults.standard.removeObject(forKey: "tz_skipped_update_version")
-                    statusBanner = "🎉 发现新版本 TypeZero \(manifest.tag)（当前 v\(currentAppVersion)），可一键自动更新并重启"
-                }
-            } else {
-                availableUpdate = nil
-                if manual {
-                    statusBanner = "✅ 当前已是最新版本 TypeZero v\(currentAppVersion)"
-                }
-            }
-            updateStatusText = ""
-        } catch {
-            updateStatusText = ""
-            if manual {
-                statusBanner = "⚠️ 检查更新失败：\(error.localizedDescription)"
-            }
-        }
-    }
-
-    public func dismissUpdateBanner() {
-        guard let upd = availableUpdate else { return }
-        skippedUpdateVersion = upd.version
-        UserDefaults.standard.set(upd.version, forKey: "tz_skipped_update_version")
-    }
-
-    public func installAvailableUpdate() async {
-        guard !isInstallingUpdate, let manifest = availableUpdate else { return }
-        isInstallingUpdate = true
-        updateDownloadProgress = 0.02
-        updateStatusText = "正在准备下载 TypeZero \(manifest.tag)…"
-
-        do {
-            let willAutoRelaunch = try await AppUpdater.downloadAndInstallMacOSUpdate(manifest: manifest) { [weak self] frac, status in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.updateDownloadProgress = frac
-                    self.updateStatusText = status
-                }
-            }
-            if willAutoRelaunch {
-                statusBanner = "✨ 正在重启并切换至 TypeZero \(manifest.tag)…"
-                try? await Task.sleep(nanoseconds: 350_000_000)
-                NSApplication.shared.terminate(nil)
-            } else {
-                isInstallingUpdate = false
-                statusBanner = "📦 已打开 TypeZero \(manifest.tag) 安装镜像，拖入 Applications 覆盖即可完成更新"
-            }
-        } catch {
-            isInstallingUpdate = false
-            updateDownloadProgress = 0.0
-            updateStatusText = ""
-            statusBanner = "❌ 自动更新失败：\(error.localizedDescription)"
-        }
+        guard manual else { return }
+        statusBanner = AppUpdater.manualCheckMessage
     }
 
     private func startPermissionWatcher() {
@@ -384,28 +242,24 @@ public final class AppState: ObservableObject {
         modelDownloader.onCompletion = { [weak self] success, msg in
             guard let self else { return }
             self.isDownloadingOfflineModel = false
+            self.downloadingLocalModel = nil
             self.offlineDownloadStatusText = msg
             self.statusBanner = msg
+            self.refreshInstalledLocalModels()
             if success {
                 self.asrEngine.reloadSenseVoiceModelAsync()
             }
         }
         asrEngine.onCloudFailoverNotice = { [weak self] reason in
             guard let self else { return }
-            self.statusBanner = "✈️ 离线满血热备已接管：\(reason)"
-            if self.isUsingDoubaoVoucher {
-                Task { [weak self] in
-                    await self?.refreshVoucherStatusIfApplicable(notifyUserOnLowOrExhausted: true)
-                }
-            }
+            self.statusBanner = "✈️ Using the on-device model instead: \(reason)"
         }
         asrEngine.onError = { [weak self] errMsg in
             guard let self else { return }
             self.isSessionActive = false
-            self.audioDucker.restoreIfNeeded()
+            self.restoreSystemAudio()
             self.hotkeyMonitor.syncRecordingState(false)
-            self.phase = .error(message: errMsg)
-            self.scheduleIdleReset(after: 2.5)
+            self.showDictationFailure(.engineError(errMsg))
         }
         asrEngine.onPartialResult = { [weak self] partial, flushTail in
             guard let self, self.isSessionActive else { return }
@@ -472,7 +326,7 @@ public final class AppState: ObservableObject {
         }
         userSubmittedViaEnter = true
         isSessionActive = false
-        audioDucker.restoreIfNeeded()
+        restoreSystemAudio()
         hotkeyMonitor.syncRecordingState(false)
         asrEngine.cancel()
         AudioLevelBus.shared.reset()
@@ -482,16 +336,75 @@ public final class AppState: ObservableObject {
         ContextInjector.appendInjectionTrace("submitEnter app=\(activeContext.bundleID) stoppedLiveSession emitted=\(emitted.count)")
     }
 
+    // MARK: Sound cues
+
+    private enum CueKind { case start, stop }
+
+    /// Loads the built-in cue sounds once at launch so the first key press does not wait for them to be read from disk.
+    private static func preloadCueSounds() {
+        for cue in [SessionCues.start, SessionCues.stop] {
+            _ = NSSound(named: NSSound.Name(cue.soundName))
+        }
+    }
+
+    /// Plays the start (Tink) or stop (Pop) cue, unless "Sound effects" is off.
+    private func playSessionCue(_ kind: CueKind) {
+        let cue = (kind == .start) ? SessionCues.start : SessionCues.stop
+        playSubtleCue(cue.soundName, volume: cue.volume)
+    }
+
+    /// A new cue first stops every cue that is still playing. This also restarts a sound whose previous play is still ringing
+    /// out (the files carry a silent tail), which would otherwise make a quick second start or stop silent.
+    private func stopAllCues() {
+        for name in SessionCues.allSoundNames {
+            if let sound = NSSound(named: NSSound.Name(name)), sound.isPlaying {
+                sound.stop()
+            }
+        }
+    }
+
+    /// Plays a built-in sound unless "Sound effects" is off.
     private func playSubtleCue(_ soundName: String, volume: Float = 0.30) {
-        guard let sound = NSSound(named: NSSound.Name(soundName)) else { return }
+        guard llmConfig.enableSoundEffects,
+              let sound = NSSound(named: NSSound.Name(soundName)) else { return }
+        stopAllCues()
         sound.volume = volume
         sound.play()
+    }
+
+    /// How long auto-mute has to wait after the start cue begins (0 when there is no cue): muting the output device would
+    /// silence the cue, so it waits for its audible part.
+    private func startCueMuteDelay() -> TimeInterval {
+        SessionCues.muteDelayAfterStartCue(soundEffectsEnabled: llmConfig.enableSoundEffects)
+    }
+
+    /// Mutes system output for the session `delay` seconds from now (at once when `delay` is 0). A mute that has not happened
+    /// yet is dropped as soon as the session ends, so a quick start/stop can never leave the Mac muted.
+    private func scheduleAutoMute(after delay: TimeInterval) {
+        pendingAutoMuteTask?.cancel()
+        pendingAutoMuteTask = nil
+        guard delay > 0 else {
+            audioDucker.muteIfNeeded()
+            return
+        }
+        pendingAutoMuteTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.isSessionActive else { return }
+            self.audioDucker.muteIfNeeded()
+        }
+    }
+
+    /// Gives system output back (and cancels a mute that has not happened yet). Do this before playing a cue that must be heard.
+    private func restoreSystemAudio() {
+        pendingAutoMuteTask?.cancel()
+        pendingAutoMuteTask = nil
+        audioDucker.restoreIfNeeded()
     }
 
     public func cancelDictationSession() {
         guard isSessionActive else { return }
         isSessionActive = false
-        audioDucker.restoreIfNeeded()
+        restoreSystemAudio()
         hotkeyMonitor.syncRecordingState(false)
         asrEngine.cancel()
         AudioLevelBus.shared.reset()
@@ -502,7 +415,7 @@ public final class AppState: ObservableObject {
         }
         liveInputSession = nil
         phase = .idle
-        playSubtleCue("Funk", volume: 0.22)
+        playSubtleCue(SessionCues.cancel.soundName, volume: SessionCues.cancel.volume)
     }
 
     public func requestAllPermissions() {
@@ -522,12 +435,43 @@ public final class AppState: ObservableObject {
         self.accessibilityGranted = ContextInjector.isAccessibilityTrusted(promptIfNeeded: false)
         self.senseVoiceLoaded = asrEngine.isUsingSenseVoice
         self.senseVoiceFullFP32 = asrEngine.isFullPrecisionFP32
+        self.activeLocalModel = asrEngine.activeLocalModel
+        refreshInstalledLocalModels()
+        clearResolvedPermissionBanner()
+    }
+
+    /// A "turn on this permission" banner left behind by a failed dictation is stale once that permission is granted.
+    private func clearResolvedPermissionBanner() {
+        let resolved = (accessibilityGranted && statusBanner == DictationFailure.accessibilityOff.bannerText)
+            || (micAuthorized && statusBanner == DictationFailure.microphoneOff.bannerText)
+            || (speechAuthorized && statusBanner == DictationFailure.speechRecognitionOff.bannerText)
+        if resolved { statusBanner = "" }
+    }
+
+    public func refreshInstalledLocalModels() {
+        let installed = Set(LocalASRModel.allCases.filter { $0.isInstalled() })
+        if installed != installedLocalModels {
+            installedLocalModels = installed
+        }
+    }
+
+    /// Switches the on-device speech model (Parakeet TDT v2 ⇄ SenseVoice). The engine hot-reloads it; if the chosen
+    /// model's files are missing the other installed model keeps running until the download finishes.
+    public func selectLocalASRModel(_ model: LocalASRModel) {
+        guard llmConfig.localASRModel != model else { return }
+        llmConfig.localASRModel = model
+        refreshInstalledLocalModels()
+        if model.isInstalled() {
+            statusBanner = "Local speech model set to \(model.displayName)."
+        } else {
+            statusBanner = "\(model.displayName) is not installed yet — download it below. Until then the other installed model (if any) is used."
+        }
     }
 
     public func resetStaleTCCAndOpenSettings() {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-        task.arguments = ["reset", "Accessibility", "io.github.typezero.macos"]
+        task.arguments = ["reset", "Accessibility", AppBrand.bundleID]
         try? task.run()
         task.waitUntilExit()
         self.accessibilityGranted = false
@@ -538,7 +482,7 @@ public final class AppState: ObservableObject {
     }
 
     public var activeTriggerDisplayName: String {
-        triggerKey == .custom ? "自定义快捷键 (\(customHotkey.label))" : triggerKey.displayName
+        triggerKey == .custom ? "Custom shortcut (\(customHotkey.label))" : triggerKey.displayName
     }
 
     public var activeTriggerCompactLabel: String {
@@ -554,11 +498,11 @@ public final class AppState: ObservableObject {
                 switch result {
                 case .preset(let opt):
                     self.triggerKey = opt
-                    self.statusBanner = "✅ 全局快捷键已切换为「\(opt.displayName)」"
+                    self.statusBanner = "✅ Trigger key set to \(opt.displayName)"
                 case .custom(let spec):
                     self.customHotkey = spec
                     self.triggerKey = .custom
-                    self.statusBanner = "✅ 自定义全局快捷键已生效：「\(spec.label)」"
+                    self.statusBanner = "✅ Custom shortcut active: \(spec.label)"
                 case .cancelled:
                     break
                 }
@@ -616,11 +560,8 @@ public final class AppState: ObservableObject {
         asrEngine.enableWhisperAGC = llmConfig.enableWhisperAGC
         asrEngine.speechLocale = llmConfig.speechLocale
         asrEngine.asrProvider = llmConfig.asrProvider
-        asrEngine.volcSpeechAPIKey = KeychainHelper.loadEffectiveDoubaoSpeechCredential(
-            voucherExhaustedOrRevoked: isDoubaoVoucherExhaustedOrRevoked
-        )
-        asrEngine.useCloudTrialRelay = isOfficialCloudTrialActive
-        asrEngine.cloudTrialJWT = KeychainHelper.loadCloudJWT()
+        asrEngine.localASRModel = llmConfig.localASRModel
+        asrEngine.volcSpeechAPIKey = KeychainHelper.loadVolcSpeechAPIKey()
         asrEngine.openAIASRBaseURL = llmConfig.openAIASRBaseURL
         asrEngine.openAIASRModel = llmConfig.openAIASRModel
         asrEngine.openAIASRAPIKey = effectiveOpenAIASRKey
@@ -633,213 +574,6 @@ public final class AppState: ObservableObject {
         updated.speechLocale = target
         updated.speechLocaleExplicitlySet = true
         llmConfig = updated
-    }
-
-    // MARK: - TypeZero Cloud Auth & Official Free Trial
-
-    public func refreshVoucherStatusIfApplicable(notifyUserOnLowOrExhausted: Bool = false) async {
-        let raw = KeychainHelper.loadDoubaoVoucherCode().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard CloudAuthClient.isVoucherCode(raw) else {
-            voucherProfile = nil
-            return
-        }
-        let code = CloudAuthClient.normalizedVoucherCode(raw)
-        do {
-            let (_, profile) = try await CloudAuthClient.fetchVoucherStatus(code: code)
-            voucherProfile = profile
-            syncASREngineConfig()
-            if notifyUserOnLowOrExhausted {
-                if profile.revoked {
-                    if hasOwnVolcSpeechKey {
-                        asrActivationErrors[.volcSeedASR] = nil
-                        statusBanner = "✅ 豆包兑换码（\(profile.code)）已停用，已自动无缝切换为您自己的豆包 API Key"
-                    } else {
-                        let msg = "⛔ 豆包语音兑换码（\(profile.code)）已停用，请联系发放人或填入您自己的豆包 API Key"
-                        asrActivationErrors[.volcSeedASR] = msg
-                        statusBanner = msg
-                    }
-                } else if profile.exhausted {
-                    if hasOwnVolcSpeechKey {
-                        asrActivationErrors[.volcSeedASR] = nil
-                        statusBanner = String(
-                            format: "✅ 豆包兑换码额度已用完（已用 %.1f / %.0f 分钟），已自动无缝切换为您自己的豆包 API Key",
-                            profile.usedMinutes,
-                            profile.quotaMinutes
-                        )
-                    } else {
-                        let msg = String(
-                            format: "⛔ 豆包语音兑换码时长已用完（已用 %.1f / %.0f 分钟），请联系发放人续期或填入您自己的豆包 API Key",
-                            profile.usedMinutes,
-                            profile.quotaMinutes
-                        )
-                        asrActivationErrors[.volcSeedASR] = msg
-                        statusBanner = msg
-                    }
-                } else if profile.remainingMinutes <= 10.0 {
-                    statusBanner = hasOwnVolcSpeechKey
-                        ? String(
-                            format: "⚠️ 豆包语音兑换码仅剩 %.1f 分钟，用完后将自动无缝切换为您自己的豆包 API Key",
-                            profile.remainingMinutes
-                        )
-                        : String(
-                            format: "⚠️ 豆包语音兑换码仅剩 %.1f 分钟（共 %.0f 分钟），请提前填入您自己的豆包 API Key 或联系续期",
-                            profile.remainingMinutes,
-                            profile.quotaMinutes
-                        )
-                }
-            }
-        } catch {
-            // Keep existing profile on transient network hiccup
-        }
-    }
-
-    public func refreshCloudAccount() async {
-        if let caps = try? await CloudAuthClient.fetchCapabilities() {
-            cloudCapabilities = caps
-        }
-        let token = KeychainHelper.loadCloudJWT().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
-            cloudUser = nil
-            syncASREngineConfig()
-            return
-        }
-        do {
-            let profile = try await CloudAuthClient.fetchProfile(token: token)
-            cloudUser = profile
-            if profile.balanceCny <= 0 && llmConfig.useOfficialCloudTrial {
-                llmConfig.useOfficialCloudTrial = false
-                cloudAuthMessage = "体验额度已用完，已自动切回个人 API Key 模式"
-            }
-            syncASREngineConfig()
-        } catch {
-            // Keep token if transient network error; clear only if explicitly unauthorized
-            let msg = error.localizedDescription
-            if msg.contains("失效") || msg.contains("401") || msg.contains("暂停") {
-                KeychainHelper.saveCloudJWT("")
-                cloudUser = nil
-                llmConfig.useOfficialCloudTrial = false
-                syncASREngineConfig()
-            }
-        }
-    }
-
-    public func sendCloudEmailCode() async {
-        let email = cloudEmailInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !email.isEmpty else {
-            cloudAuthMessage = "请先输入邮箱地址（推荐使用 Gmail）"
-            return
-        }
-        isCloudAuthBusy = true
-        cloudAuthMessage = ""
-        defer { isCloudAuthBusy = false }
-        do {
-            let msg = try await CloudAuthClient.sendEmailCode(email: email)
-            cloudCodeSent = true
-            cloudAuthMessage = "✅ \(msg)"
-        } catch {
-            cloudAuthMessage = "❌ \(error.localizedDescription)"
-        }
-    }
-
-    public func verifyCloudEmailCode() async {
-        let email = cloudEmailInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        let code = cloudCodeInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !email.isEmpty, code.count == 6 else {
-            cloudAuthMessage = "请输入邮箱和 6 位数字验证码"
-            return
-        }
-        isCloudAuthBusy = true
-        cloudAuthMessage = ""
-        defer { isCloudAuthBusy = false }
-        do {
-            let res = try await CloudAuthClient.verifyEmailCode(email: email, code: code)
-            applyCloudAuthSuccess(token: res.token, user: res.user, grantedTrial: res.grantedTrial ?? false)
-            cloudCodeInput = ""
-            cloudCodeSent = false
-        } catch {
-            cloudAuthMessage = "❌ \(error.localizedDescription)"
-        }
-    }
-
-    public func startCloudGoogleLogin() async {
-        googlePollTask?.cancel()
-        isCloudAuthBusy = true
-        cloudAuthMessage = ""
-        defer { isCloudAuthBusy = false }
-        do {
-            let started = try await CloudAuthClient.startGoogleLogin()
-            if let url = URL(string: started.authUrl) {
-                NSWorkspace.shared.open(url)
-            }
-            isWaitingGoogleOAuth = true
-            cloudAuthMessage = "请在浏览器中选择 Google 账号完成授权…"
-            let sid = started.sessionId
-            googlePollTask = Task { [weak self] in
-                for _ in 0..<90 {
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    guard !Task.isCancelled, let self else { return }
-                    do {
-                        let poll = try await CloudAuthClient.pollGoogleLogin(sessionId: sid)
-                        if poll.status == "completed", let tok = poll.token, let u = poll.user {
-                            self.isWaitingGoogleOAuth = false
-                            self.applyCloudAuthSuccess(token: tok, user: u, grantedTrial: poll.grantedTrial ?? false)
-                            return
-                        } else if poll.status == "error" || poll.status == "expired" {
-                            self.isWaitingGoogleOAuth = false
-                            self.cloudAuthMessage = "❌ \(poll.error ?? "Google 登录未完成，请重试")"
-                            return
-                        }
-                    } catch {
-                        // Ignore transient poll hiccup
-                    }
-                }
-                self?.isWaitingGoogleOAuth = false
-            }
-        } catch {
-            isWaitingGoogleOAuth = false
-            cloudAuthMessage = "❌ \(error.localizedDescription)"
-        }
-    }
-
-    private func applyCloudAuthSuccess(token: String, user: CloudUserProfile, grantedTrial: Bool) {
-        KeychainHelper.saveCloudJWT(token)
-        cloudUser = user
-        if user.balanceCny > 0 {
-            llmConfig.useOfficialCloudTrial = true
-            llmConfig.selectASRProvider(.volcSeedASR)
-        }
-        syncASREngineConfig()
-        let bonusNote = grantedTrial
-            ? String(format: "🎁 新用户已自动获赠 ¥%.2f 免费体验额度，现在即可直接按快捷键说话！", user.balanceCny)
-            : String(format: "✅ 登录成功，当前体验余额 ¥%.2f", user.balanceCny)
-        cloudAuthMessage = bonusNote
-        statusBanner = bonusNote
-    }
-
-    public func setUseOfficialCloudTrial(_ enabled: Bool) {
-        if enabled {
-            guard let u = cloudUser, u.balanceCny > 0 else {
-                cloudAuthMessage = "体验余额不足，请配置您自己的 API Key"
-                return
-            }
-            llmConfig.useOfficialCloudTrial = true
-            llmConfig.selectASRProvider(.volcSeedASR)
-            statusBanner = "☁️ 已切换至官方免费体验通道（豆包 2.0 + DeepSeek 4 Flash）"
-        } else {
-            llmConfig.useOfficialCloudTrial = false
-            statusBanner = "🔑 已切换至个人 API Key（BYOK）模式"
-        }
-        syncASREngineConfig()
-    }
-
-    public func logoutCloudAccount() {
-        googlePollTask?.cancel()
-        isWaitingGoogleOAuth = false
-        KeychainHelper.saveCloudJWT("")
-        cloudUser = nil
-        llmConfig.useOfficialCloudTrial = false
-        cloudAuthMessage = "已退出云端账号"
-        syncASREngineConfig()
     }
 
     public func selectASRProvider(_ provider: ASRProviderOption) {
@@ -860,73 +594,28 @@ public final class AppState: ObservableObject {
         case .volcSeedASR:
             let typedOwn = volcSpeechKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
             if !typedOwn.isEmpty {
-                if CloudAuthClient.isVoucherCode(typedOwn) {
-                    let code = CloudAuthClient.normalizedVoucherCode(typedOwn)
-                    KeychainHelper.saveDoubaoVoucherCode(code)
-                    doubaoVoucherInput = code
-                    volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
-                } else {
-                    KeychainHelper.saveVolcSpeechAPIKey(typedOwn)
-                    volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
-                }
+                KeychainHelper.saveVolcSpeechAPIKey(typedOwn)
+                volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
                 syncASREngineConfig()
             }
-            let key = KeychainHelper.loadEffectiveDoubaoSpeechCredential(
-                voucherExhaustedOrRevoked: isDoubaoVoucherExhaustedOrRevoked
-            )
+            let key = KeychainHelper.loadVolcSpeechAPIKey()
             guard !key.isEmpty else {
-                let err = "❌ 无法生效：请先填入您自己的豆包语音 API Key（或在下方填入朋友兑换码）"
+                let err = "❌ Can't activate: enter your own Doubao speech API key first"
                 asrActivationErrors[provider] = err
                 statusBanner = err
                 return false
             }
             do {
-                if CloudAuthClient.isVoucherCode(key) {
-                    let code = CloudAuthClient.normalizedVoucherCode(key)
-                    let (asrReady, profile) = try await CloudAuthClient.fetchVoucherStatus(code: code)
-                    voucherProfile = profile
-                    guard asrReady else {
-                        throw CloudAuthError.serverError("云端豆包语音服务暂未就绪，请稍后再试")
-                    }
-                    guard !profile.revoked else {
-                        throw CloudAuthError.serverError("该兑换码已被停用，请联系发放人")
-                    }
-                    guard !profile.exhausted else {
-                        throw CloudAuthError.serverError(
-                            String(format: "该兑换码时长已用完（已用 %.1f / %.0f 分钟），请联系发放人续期", profile.usedMinutes, profile.quotaMinutes)
-                        )
-                    }
-                    let rttMs = try await VolcSeedASRClient.probeHandshakeLatency(
-                        apiKey: code,
-                        customEndpointURL: CloudAuthClient.cloudASRWSURL,
-                        useBearerAuth: true
-                    )
-                    llmConfig.selectASRProvider(.volcSeedASR)
-                    syncASREngineConfig()
-                    speechAuthorized = StreamingASREngine.isSpeechAuthorized
-                    let noteTag = profile.note.isEmpty ? "" : " · \(profile.note)"
-                    lastSeedASRProbeSummary = String(
-                        format: "🎟️ 兑换码校验通过（%@%@）：剩余 %.1f / %.0f 分钟 · 首帧 %dms",
-                        profile.code, noteTag, profile.remainingMinutes, profile.quotaMinutes, rttMs
-                    )
-                    statusBanner = String(
-                        format: "✅ 豆包语音兑换码已生效（剩余 %.1f 分钟），现在可直接按快捷键听写",
-                        profile.remainingMinutes
-                    )
-                    return true
-                } else {
-                    voucherProfile = nil
-                    let rttMs = try await VolcSeedASRClient.probeHandshakeLatency(apiKey: key)
-                    llmConfig.selectASRProvider(.volcSeedASR)
-                    syncASREngineConfig()
-                    speechAuthorized = StreamingASREngine.isSpeechAuthorized
-                    let hotCount = min(65, lexiconStore.entries.count)
-                    lastSeedASRProbeSummary = "⚡ 校验通过并已生效（volc.seedasr.sauc.duration）：国内直连首帧 \(rttMs)ms · 已挂载 \(hotCount) 个专属热词"
-                    statusBanner = "✅ 豆包流式语音大模型 2.0 校验通过，已切换为当前唯一生效引擎"
-                    return true
-                }
+                let rttMs = try await VolcSeedASRClient.probeHandshakeLatency(apiKey: key)
+                llmConfig.selectASRProvider(.volcSeedASR)
+                syncASREngineConfig()
+                speechAuthorized = StreamingASREngine.isSpeechAuthorized
+                let hotCount = min(65, lexiconStore.entries.count)
+                lastSeedASRProbeSummary = "⚡ Verified and active (volc.seedasr.sauc.duration): direct connection, first frame \(rttMs)ms · \(hotCount) hotwords loaded"
+                statusBanner = "✅ Doubao streaming speech 2.0 verified and now the active engine"
+                return true
             } catch {
-                let err = "❌ 校验未通过，未生效：\(error.localizedDescription)"
+                let err = "❌ Verification failed, not activated: \(error.localizedDescription)"
                 asrActivationErrors[provider] = err
                 statusBanner = err
                 return false
@@ -947,11 +636,11 @@ public final class AppState: ObservableObject {
                 openAIASRKeyInput = KeychainHelper.loadOpenAIASROverrideKey()
             }
             syncASREngineConfig()
-            let label = isGroqASRSelected ? "Groq Whisper" : "OpenAI 语音大模型"
+            let label = isGroqASRSelected ? "Groq Whisper" : "OpenAI speech model"
             guard hasEffectiveOpenAIASRKey else {
                 let err = isGroqASRSelected
-                    ? "❌ 无法生效：缺少 Groq API Key，请先填入有效密钥（当前配置未生效）"
-                    : "❌ 无法生效：缺少 OpenAI API Key，请先填入有效密钥（当前配置未生效）"
+                    ? "❌ Can't activate: no Groq API key. Enter a valid key first (current settings are not active)."
+                    : "❌ Can't activate: no OpenAI API key. Enter a valid key first (current settings are not active)."
                 asrActivationErrors[provider] = err
                 statusBanner = err
                 return false
@@ -967,20 +656,20 @@ public final class AppState: ObservableObject {
                 syncASREngineConfig()
                 speechAuthorized = StreamingASREngine.isSpeechAuthorized
                 let hotCount = min(40, lexiconStore.entries.count)
-                let keyMode = isOpenAIASRReusingLLMKey ? "自动复用 OpenAI Key" : "独立密钥"
-                lastOpenAIASRProbeSummary = "⚡ 校验通过并已生效（\(llmConfig.openAIASRModel)）：音频上传+转写 \(rttMs)ms · \(keyMode) · 将注入 Top-\(hotCount) 词库提示"
-                statusBanner = "✅ \(label) 校验通过，已切换为当前唯一生效引擎"
+                let keyMode = isOpenAIASRReusingLLMKey ? "reusing your OpenAI key" : "separate key"
+                lastOpenAIASRProbeSummary = "⚡ Verified and active (\(llmConfig.openAIASRModel)): audio upload + transcription \(rttMs)ms · \(keyMode) · top \(hotCount) dictionary terms sent as hints"
+                statusBanner = "✅ \(label) verified and now the active engine"
                 return true
             } catch {
-                let err = "❌ 校验未通过，未生效：\(error.localizedDescription)"
+                let err = "❌ Verification failed, not activated: \(error.localizedDescription)"
                 asrActivationErrors[provider] = err
                 statusBanner = err
                 return false
             }
 
         case .localSenseVoice:
-            if StreamingASREngine.senseVoiceModelPaths() == nil {
-                let err = "❌ 无法生效：本机 SenseVoice 离线模型尚未下载就绪，请先下载离线模型包"
+            if !LocalASRModel.anyInstalled() {
+                let err = "❌ Cannot activate: no local speech model is installed yet. Download Parakeet or SenseVoice first."
                 asrActivationErrors[provider] = err
                 statusBanner = err
                 return false
@@ -992,7 +681,7 @@ public final class AppState: ObservableObject {
             llmConfig.selectASRProvider(.localSenseVoice)
             syncASREngineConfig()
             speechAuthorized = StreamingASREngine.isSpeechAuthorized
-            statusBanner = "✅ 纯本机 SenseVoice 离线模型已校验就绪并设为当前唯一生效引擎"
+            statusBanner = "✅ Local offline engine (\(llmConfig.localASRModel.displayName)) is ready and now the active speech engine"
             return true
         }
     }
@@ -1018,7 +707,7 @@ public final class AppState: ObservableObject {
         KeychainHelper.saveAPIKey(apiKey, for: provider)
         if llmConfig.selectedProvider == provider {
             apiKeyInput = KeychainHelper.loadAPIKey(for: provider)
-            polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput)
+            polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput, model: llmConfig.modelName)
         }
         refreshSavedKeyFlags()
         syncASREngineConfig()
@@ -1030,11 +719,11 @@ public final class AppState: ObservableObject {
         }
         let savedKey = KeychainHelper.loadAPIKey(for: provider)
         if savedKey.isEmpty && !PolishEngine.isKeylessLocalEndpoint(finalURL) {
-            statusBanner = "已清空「\(provider.shortName)」API Key"
+            statusBanner = "Cleared the \(provider.shortName) API key"
         } else if llmConfig.selectedProvider == provider {
-            statusBanner = "✅ 「\(provider.title)」密钥与模型已保存"
+            statusBanner = "✅ \(provider.title): key and model saved"
         } else {
-            statusBanner = "💾 「\(provider.title)」配置已保存（尚未设为当前生效，点击「校验并生效」启用）"
+            statusBanner = "💾 \(provider.title): settings saved (not active yet, verify to switch)"
         }
     }
 
@@ -1060,7 +749,7 @@ public final class AppState: ObservableObject {
 
         let isKeylessLocal = PolishEngine.isKeylessLocalEndpoint(finalURL)
         if cleanKey.isEmpty && !isKeylessLocal {
-            let err = "❌ 无法生效：请先填入「\(provider.shortName)」API Key（当前配置未生效）"
+            let err = "❌ Can't activate: enter your \(provider.shortName) API key first (current settings are not active)"
             llmActivationErrors[provider] = err
             statusBanner = err
             return false
@@ -1091,16 +780,16 @@ public final class AppState: ObservableObject {
             apiKeyInput = KeychainHelper.loadAPIKey(for: provider)
             refreshSavedKeyFlags()
             syncASREngineConfig()
-            polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput)
+            polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput, model: llmConfig.modelName)
 
             let flatSample = res.sampleOutput.replacingOccurrences(of: "\n", with: " ↵ ")
-            let summary = "⚡ 校验通过并已生效（\(finalModel)）：首字 TTFT \(res.ttftMs)ms · 总耗时 \(res.totalMs)ms · 样例：「\(flatSample)」"
+            let summary = "⚡ Verified and active (\(finalModel)): first token \(res.ttftMs)ms · total \(res.totalMs)ms · sample: \"\(flatSample)\""
             llmProviderBenchmarkSummaries[provider] = summary
             lastBenchmarkSummary = summary
-            statusBanner = "✅ 「\(provider.title)」校验通过，已切换为当前唯一生效排版模型"
+            statusBanner = "✅ \(provider.title) verified and now the active cleanup model"
             return true
         } catch {
-            let err = "❌ 校验未通过，未生效：\(error.localizedDescription)"
+            let err = "❌ Verification failed, not activated: \(error.localizedDescription)"
             llmActivationErrors[provider] = err
             statusBanner = err
             return false
@@ -1122,7 +811,7 @@ public final class AppState: ObservableObject {
         let finalURL = cleanURL.isEmpty ? provider.defaultBaseURL : cleanURL
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        llmProviderBenchmarkSummaries[provider] = "正在预热连接并实测 \(finalModel) 首包延迟…"
+        llmProviderBenchmarkSummaries[provider] = "Warming up the connection and measuring \(finalModel) first-token latency…"
         if llmConfig.selectedProvider == provider {
             lastBenchmarkSummary = llmProviderBenchmarkSummaries[provider] ?? ""
         }
@@ -1141,14 +830,14 @@ public final class AppState: ObservableObject {
         do {
             let res = try await polishEngine.benchmarkLatency(config: probeConfig, apiKey: cleanKey)
             let flatSample = res.sampleOutput.replacingOccurrences(of: "\n", with: " ↵ ")
-            let summary = "⚡ 实测通过（\(finalModel)）：首字 TTFT \(res.ttftMs)ms · 总耗时 \(res.totalMs)ms · 样例：「\(flatSample)」"
+            let summary = "⚡ Test passed (\(finalModel)): first token \(res.ttftMs)ms · total \(res.totalMs)ms · sample: \"\(flatSample)\""
             llmProviderBenchmarkSummaries[provider] = summary
             if llmConfig.selectedProvider == provider {
                 lastBenchmarkSummary = summary
             }
-            statusBanner = "⚡ \(provider.shortName) 实测成功：首字 TTFT \(res.ttftMs)ms"
+            statusBanner = "⚡ \(provider.shortName) test passed: first token \(res.ttftMs)ms"
         } catch {
-            let summary = "❌ 测速未通过：\(error.localizedDescription)"
+            let summary = "❌ Latency test failed: \(error.localizedDescription)"
             llmProviderBenchmarkSummaries[provider] = summary
             if llmConfig.selectedProvider == provider {
                 lastBenchmarkSummary = summary
@@ -1173,24 +862,15 @@ public final class AppState: ObservableObject {
         refreshSavedKeyFlags()
         syncASREngineConfig()
         speechAuthorized = StreamingASREngine.isSpeechAuthorized
-        polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput)
+        polishEngine.prewarmConnection(baseURL: llmConfig.baseURL, apiKey: apiKeyInput, model: llmConfig.modelName)
         lastBenchmarkSummary = ""
         statusBanner = apiKeyInput.isEmpty
-            ? "已清空「\(llmConfig.selectedProvider.shortName)」API Key"
-            : "✅ 「\(llmConfig.selectedProvider.title)」密钥与模型已保存并立即生效"
+            ? "Cleared the \(llmConfig.selectedProvider.shortName) API key"
+            : "✅ \(llmConfig.selectedProvider.title): key and model saved and active"
     }
 
     public func saveVolcSpeechAPIKey() {
         let trimmed = volcSpeechKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if CloudAuthClient.isVoucherCode(trimmed) {
-            // Gracefully route pasted voucher codes into the dedicated voucher slot without clobbering own key
-            doubaoVoucherInput = CloudAuthClient.normalizedVoucherCode(trimmed)
-            volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
-            Task { [weak self] in
-                await self?.saveDoubaoVoucherCode()
-            }
-            return
-        }
         KeychainHelper.saveVolcSpeechAPIKey(trimmed)
         volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
         syncASREngineConfig()
@@ -1198,96 +878,12 @@ public final class AppState: ObservableObject {
         lastSeedASRProbeSummary = ""
         asrActivationErrors[.volcSeedASR] = nil
         if volcSpeechKeyInput.isEmpty {
-            statusBanner = hasDoubaoVoucher
-                ? "已清空自有豆包 API Key（当前继续使用已存兑换码）"
-                : "已清空豆包语音密钥"
-        } else if isUsingDoubaoVoucher {
-            let remText = voucherProfile.map { String(format: "剩余 %.1f 分钟", $0.remainingMinutes) } ?? "剩余额度"
-            statusBanner = "✅ 您自己的豆包 API Key 已保存（将优先用完兑换码\(remText)，用完后自动无缝切换为自有 Key）"
+            statusBanner = "Cleared the Doubao speech key"
         } else if llmConfig.asrProvider == .volcSeedASR {
-            statusBanner = "✅ 您自己的豆包 Seed-ASR 2.0 密钥已保存并生效"
+            statusBanner = "✅ Your own Doubao Seed-ASR 2.0 key is saved and active"
         } else {
-            statusBanner = "💾 豆包自有密钥已保存（尚未设为当前生效，点击「校验并切换」启用）"
+            statusBanner = "💾 Your Doubao key is saved (not active yet, verify to switch)"
         }
-    }
-
-    public func saveDoubaoVoucherCode() async {
-        let trimmed = doubaoVoucherInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        asrActivationErrors[.volcSeedASR] = nil
-        if trimmed.isEmpty {
-            clearDoubaoVoucherCode()
-            return
-        }
-        guard CloudAuthClient.isVoucherCode(trimmed) else {
-            let err = "❌ 兑换码格式应为 TZ-XXXX-XXXX（自有密钥请填上方 API Key 输入框）"
-            asrActivationErrors[.volcSeedASR] = err
-            statusBanner = err
-            return
-        }
-        let code = CloudAuthClient.normalizedVoucherCode(trimmed)
-        KeychainHelper.saveDoubaoVoucherCode(code)
-        doubaoVoucherInput = code
-        voucherProfile = nil
-        syncASREngineConfig()
-        speechAuthorized = StreamingASREngine.isSpeechAuthorized
-        statusBanner = "🎟️ 正在校验豆包语音兑换码 \(code)…"
-
-        do {
-            let (asrReady, profile) = try await CloudAuthClient.fetchVoucherStatus(code: code)
-            voucherProfile = profile
-            syncASREngineConfig()
-            if profile.revoked {
-                let msg = hasOwnVolcSpeechKey
-                    ? "⚠️ 该兑换码（\(profile.code)）已停用，当前已自动使用您自己的豆包 API Key"
-                    : "⛔ 豆包语音兑换码（\(profile.code)）已停用，请联系发放人或填入自有 API Key"
-                if !hasOwnVolcSpeechKey { asrActivationErrors[.volcSeedASR] = msg }
-                statusBanner = msg
-                return
-            }
-            if profile.exhausted {
-                let msg = hasOwnVolcSpeechKey
-                    ? String(format: "✅ 该兑换码时长已用完（已用 %.1f / %.0f 分钟），当前已自动使用您自己的豆包 API Key", profile.usedMinutes, profile.quotaMinutes)
-                    : String(format: "⛔ 豆包语音兑换码时长已用完（已用 %.1f / %.0f 分钟），请联系发放人续期或填入自有 API Key", profile.usedMinutes, profile.quotaMinutes)
-                if !hasOwnVolcSpeechKey { asrActivationErrors[.volcSeedASR] = msg }
-                statusBanner = msg
-                return
-            }
-            guard asrReady else {
-                let msg = "⚠️ 云端豆包语音服务暂未就绪，请稍后再试"
-                asrActivationErrors[.volcSeedASR] = msg
-                statusBanner = msg
-                return
-            }
-            llmConfig.selectASRProvider(.volcSeedASR)
-            syncASREngineConfig()
-            let noteTag = profile.note.isEmpty ? "" : "（\(profile.note)）"
-            let autoSwitchHint = hasOwnVolcSpeechKey ? " · 用完自动切回自有 Key" : ""
-            lastSeedASRProbeSummary = String(
-                format: "🎟️ 兑换码已激活：%@%@ · 剩余 %.1f / %.0f 分钟%@",
-                profile.code, noteTag, profile.remainingMinutes, profile.quotaMinutes, autoSwitchHint
-            )
-            statusBanner = String(
-                format: "✅ 豆包兑换码已生效（剩余 %.1f 分钟%@）",
-                profile.remainingMinutes, autoSwitchHint
-            )
-        } catch {
-            let msg = "❌ 兑换码校验失败：\(error.localizedDescription)"
-            asrActivationErrors[.volcSeedASR] = msg
-            statusBanner = msg
-        }
-    }
-
-    public func clearDoubaoVoucherCode() {
-        KeychainHelper.saveDoubaoVoucherCode("")
-        doubaoVoucherInput = ""
-        voucherProfile = nil
-        syncASREngineConfig()
-        speechAuthorized = StreamingASREngine.isSpeechAuthorized
-        lastSeedASRProbeSummary = ""
-        asrActivationErrors[.volcSeedASR] = nil
-        statusBanner = hasOwnVolcSpeechKey
-            ? "已移除兑换码，已自动切回您自己的豆包 API Key"
-            : "已移除豆包语音兑换码"
     }
 
     public func saveOpenAIASRConfig() {
@@ -1306,24 +902,24 @@ public final class AppState: ObservableObject {
         lastOpenAIASRProbeSummary = ""
         asrActivationErrors[.openAIWhisper] = nil
         asrEngine.prewarmCloudSocketIfReady()
-        let label = isGroqASRSelected ? "Groq Whisper" : "OpenAI 语音大模型"
+        let label = isGroqASRSelected ? "Groq Whisper" : "OpenAI speech model"
         if hasEffectiveOpenAIASRKey {
-            let keyNote = isOpenAIASRReusingLLMKey ? "（自动复用 OpenAI 密钥）" : ""
+            let keyNote = isOpenAIASRReusingLLMKey ? " (reusing your OpenAI key)" : ""
             if llmConfig.asrProvider == .openAIWhisper {
-                statusBanner = "✅ \(label)（\(llmConfig.openAIASRModel)）已保存\(keyNote)"
+                statusBanner = "✅ \(label) (\(llmConfig.openAIASRModel)) saved\(keyNote)"
             } else {
-                statusBanner = "💾 \(label)（\(llmConfig.openAIASRModel)）已保存\(keyNote)（点击「校验并生效」启用）"
+                statusBanner = "💾 \(label) (\(llmConfig.openAIASRModel)) saved\(keyNote). Verify to switch to it."
             }
         } else {
-            statusBanner = "⚠️ 已保存 \(label) 接口设置，但当前尚未填入有效 API Key"
+            statusBanner = "⚠️ \(label) endpoint settings saved, but there is no valid API key yet"
         }
     }
 
     public func runOpenAIASRProbe() async {
         guard !isProbingOpenAIASR else { return }
         isProbingOpenAIASR = true
-        let label = isGroqASRSelected ? "Groq Whisper" : "OpenAI 语音"
-        lastOpenAIASRProbeSummary = "正在向 \(llmConfig.openAIASRModel) 发送 0.35s 音频实测端到端延迟…"
+        let label = isGroqASRSelected ? "Groq Whisper" : "OpenAI speech"
+        lastOpenAIASRProbeSummary = "Sending 0.35s of audio to \(llmConfig.openAIASRModel) to measure end-to-end latency…"
         defer { isProbingOpenAIASR = false }
 
         KeychainHelper.saveOpenAIASRAPIKey(openAIASRKeyInput)
@@ -1338,25 +934,27 @@ public final class AppState: ObservableObject {
                 apiKey: effectiveKey
             )
             let hotCount = min(40, lexiconStore.entries.count)
-            let keyMode = isOpenAIASRReusingLLMKey ? "自动复用 OpenAI Key" : "独立密钥"
-            lastOpenAIASRProbeSummary = "⚡ 实测通过（\(llmConfig.openAIASRModel)）：音频上传+转写 \(rttMs)ms · \(keyMode) · 将注入 Top-\(hotCount) 词库提示"
-            statusBanner = "⚡ \(label) 连通成功：实测 \(rttMs)ms"
+            let keyMode = isOpenAIASRReusingLLMKey ? "reusing your OpenAI key" : "separate key"
+            lastOpenAIASRProbeSummary = "⚡ Test passed (\(llmConfig.openAIASRModel)): audio upload + transcription \(rttMs)ms · \(keyMode) · top \(hotCount) dictionary terms sent as hints"
+            statusBanner = "⚡ \(label) connected: \(rttMs)ms round trip"
         } catch {
-            lastOpenAIASRProbeSummary = "❌ \(label) 连通未通过：\(error.localizedDescription)"
+            lastOpenAIASRProbeSummary = "❌ \(label) connection failed: \(error.localizedDescription)"
         }
     }
 
-    public func startOfflineModelDownload() {
+    public func startLocalModelDownload(_ model: LocalASRModel) {
         guard !isDownloadingOfflineModel else { return }
         isDownloadingOfflineModel = true
+        downloadingLocalModel = model
         offlineDownloadProgress = 0.01
-        offlineDownloadStatusText = "正在初始化 886MB 离线满血包下载…"
-        modelDownloader.startDownload()
+        offlineDownloadStatusText = "Starting \(model.shortName) download (~\(model.approxDownloadMB) MB)…"
+        modelDownloader.startDownload(model: model)
     }
 
     public func cancelOfflineModelDownload() {
         modelDownloader.cancelDownload()
         isDownloadingOfflineModel = false
+        downloadingLocalModel = nil
     }
 
     public func applyDockVisibilityPolicy() {
@@ -1375,58 +973,22 @@ public final class AppState: ObservableObject {
         guard !isProbingSeedASR else { return }
         isProbingSeedASR = true
         let typedOwn = volcSpeechKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !typedOwn.isEmpty && !CloudAuthClient.isVoucherCode(typedOwn) {
+        if !typedOwn.isEmpty {
             KeychainHelper.saveVolcSpeechAPIKey(typedOwn)
             volcSpeechKeyInput = KeychainHelper.loadVolcSpeechAPIKey()
         }
-        let key = KeychainHelper.loadEffectiveDoubaoSpeechCredential(
-            voucherExhaustedOrRevoked: isDoubaoVoucherExhaustedOrRevoked
-        )
+        let key = KeychainHelper.loadVolcSpeechAPIKey()
         asrEngine.volcSpeechAPIKey = key
-        let isVoucher = CloudAuthClient.isVoucherCode(key)
-        lastSeedASRProbeSummary = isVoucher
-            ? "正在校验豆包语音兑换码剩余时长与云端通道…"
-            : "正在通过国内直连通道实测豆包 Seed-ASR 2.0 双向流…"
+        lastSeedASRProbeSummary = "Testing the Doubao Seed-ASR 2.0 bidirectional stream over the direct connection…"
         defer { isProbingSeedASR = false }
 
         do {
-            if CloudAuthClient.isVoucherCode(key) {
-                let code = CloudAuthClient.normalizedVoucherCode(key)
-                let (asrReady, profile) = try await CloudAuthClient.fetchVoucherStatus(code: code)
-                voucherProfile = profile
-                guard asrReady else {
-                    throw CloudAuthError.serverError("云端豆包语音服务暂未就绪")
-                }
-                guard !profile.revoked else {
-                    throw CloudAuthError.serverError("该兑换码已被停用，请联系发放人")
-                }
-                guard !profile.exhausted else {
-                    throw CloudAuthError.serverError(
-                        String(format: "该兑换码时长已用完（已用 %.1f / %.0f 分钟），请联系发放人续期", profile.usedMinutes, profile.quotaMinutes)
-                    )
-                }
-                let rttMs = try await VolcSeedASRClient.probeHandshakeLatency(
-                    apiKey: code,
-                    customEndpointURL: CloudAuthClient.cloudASRWSURL,
-                    useBearerAuth: true
-                )
-                let noteTag = profile.note.isEmpty ? "" : " · \(profile.note)"
-                lastSeedASRProbeSummary = String(
-                    format: "🎟️ 兑换码实测通过（%@%@）：剩余 %.1f / %.0f 分钟 · 首帧 %dms",
-                    profile.code, noteTag, profile.remainingMinutes, profile.quotaMinutes, rttMs
-                )
-                statusBanner = String(
-                    format: "⚡ 豆包兑换码连通成功（剩余 %.1f 分钟 · %dms）",
-                    profile.remainingMinutes, rttMs
-                )
-            } else {
-                let rttMs = try await VolcSeedASRClient.probeHandshakeLatency(apiKey: key)
-                let hotCount = min(65, lexiconStore.entries.count)
-                lastSeedASRProbeSummary = "⚡ 实测通过（volc.seedasr.sauc.duration）：国内直连握手+首帧 \(rttMs)ms · 已挂载 \(hotCount) 个专属热词"
-                statusBanner = "⚡ 豆包 Seed-ASR 2.0 连通成功：首帧 \(rttMs)ms"
-            }
+            let rttMs = try await VolcSeedASRClient.probeHandshakeLatency(apiKey: key)
+            let hotCount = min(65, lexiconStore.entries.count)
+            lastSeedASRProbeSummary = "⚡ Test passed (volc.seedasr.sauc.duration): direct connection, handshake + first frame \(rttMs)ms · \(hotCount) hotwords loaded"
+            statusBanner = "⚡ Doubao Seed-ASR 2.0 connected: first frame \(rttMs)ms"
         } catch {
-            lastSeedASRProbeSummary = "❌ 豆包语音连通未通过：\(error.localizedDescription)"
+            lastSeedASRProbeSummary = "❌ Doubao speech connection failed: \(error.localizedDescription)"
         }
     }
 
@@ -1434,7 +996,7 @@ public final class AppState: ObservableObject {
         guard !isBenchmarkingLLM else { return }
         isBenchmarkingLLM = true
         llmConfig.syncActiveEndpointEdits()
-        lastBenchmarkSummary = "正在预热连接并实测 \(llmConfig.modelName) 首包延迟…"
+        lastBenchmarkSummary = "Warming up the connection and measuring \(llmConfig.modelName) first-token latency…"
         defer { isBenchmarkingLLM = false }
 
         // Auto-save if user typed into field without clicking save first
@@ -1448,10 +1010,10 @@ public final class AppState: ObservableObject {
         do {
             let res = try await polishEngine.benchmarkLatency(config: llmConfig, apiKey: key)
             let flatSample = res.sampleOutput.replacingOccurrences(of: "\n", with: " ↵ ")
-            lastBenchmarkSummary = "⚡ 实测通过（\(llmConfig.modelName)）：首字 TTFT \(res.ttftMs)ms · 总耗时 \(res.totalMs)ms · 样例：「\(flatSample)」"
-            statusBanner = "⚡ \(llmConfig.selectedProvider.shortName) 实测成功：首字 TTFT \(res.ttftMs)ms"
+            lastBenchmarkSummary = "⚡ Test passed (\(llmConfig.modelName)): first token \(res.ttftMs)ms · total \(res.totalMs)ms · sample: \"\(flatSample)\""
+            statusBanner = "⚡ \(llmConfig.selectedProvider.shortName) test passed: first token \(res.ttftMs)ms"
         } catch {
-            lastBenchmarkSummary = "❌ 测速未通过：\(error.localizedDescription)"
+            lastBenchmarkSummary = "❌ Latency test failed: \(error.localizedDescription)"
         }
     }
 
@@ -1471,11 +1033,9 @@ public final class AppState: ObservableObject {
                 self.micAuthorized = mic
                 self.speechAuthorized = speech
                 if !mic {
-                    self.phase = .error(message: "请在系统设置→麦克风中允许 TypeZero")
-                    self.scheduleIdleReset(after: 2.8)
+                    self.showDictationFailure(.microphoneOff)
                 } else if !speech {
-                    self.phase = .error(message: "请在系统设置→语音识别中允许 TypeZero")
-                    self.scheduleIdleReset(after: 2.8)
+                    self.showDictationFailure(.speechRecognitionOff)
                 }
             }
             return
@@ -1484,11 +1044,10 @@ public final class AppState: ObservableObject {
         let frontApp = NSWorkspace.shared.frontmostApplication
         let frontBundle = frontApp?.bundleIdentifier ?? ""
         let frontName = frontApp?.localizedName ?? ""
-        isTypingInsideOwnApp = (frontBundle == "io.github.typezero.macos")
+        isTypingInsideOwnApp = (frontBundle == AppBrand.bundleID)
         if !isTypingInsideOwnApp && !accessibilityGranted {
             hotkeyMonitor.syncRecordingState(false)
-            phase = .error(message: "请在系统设置→辅助功能中开启 TypeZero 才能写入外部输入框")
-            scheduleIdleReset(after: 2.6)
+            showDictationFailure(.accessibilityOff)
             return
         }
 
@@ -1514,10 +1073,11 @@ public final class AppState: ObservableObject {
         let session: LiveInputSession? = llmConfig.enableLiveInlineTyping ? LiveInputSession(context: fastInitialContext) : nil
         liveInputSession = session
         phase = .listening(livePreview: "", mode: .dictate)
+        // Start cue first, whatever the auto-mute setting; auto-mute then waits until the cue has played, because muting the
+        // output device would silence the cue too (nothing to wait for when sound effects are off).
+        playSessionCue(.start)
         if llmConfig.enableAutoMuteDuringDictation {
-            audioDucker.muteIfNeeded()
-        } else {
-            playSubtleCue("Tink", volume: 0.30)
+            scheduleAutoMute(after: startCueMuteDelay())
         }
 
         // 2. Zero-wait parallel mic start!
@@ -1533,7 +1093,8 @@ public final class AppState: ObservableObject {
 
         let currentBaseURL = llmConfig.baseURL
         let currentKey = KeychainHelper.loadAPIKey(for: llmConfig.selectedProvider)
-        polishEngine.prewarmConnection(baseURL: currentBaseURL, apiKey: currentKey)
+        // For a local Ollama endpoint this also loads the cleanup model (keep_alive -1: resident until Ollama quits) while the user is still speaking.
+        polishEngine.prewarmConnection(baseURL: currentBaseURL, apiKey: currentKey, model: llmConfig.modelName)
 
         // Immediate hotword ranking + dialog_ctx from fast in-memory sources -> instant mic open!
         let immediateHint = ([frontName, shortClipboardHint, ownSandboxSnapshot] + recentSnippets).joined(separator: " ")
@@ -1582,7 +1143,7 @@ public final class AppState: ObservableObject {
         isFinalizingSession = true
         defer {
             isFinalizingSession = false
-            audioDucker.restoreIfNeeded()
+            restoreSystemAudio()
         }
         hotkeyMonitor.syncRecordingState(false)
 
@@ -1592,10 +1153,12 @@ public final class AppState: ObservableObject {
 
         isSessionActive = false
         // Immediately restore system audio output as soon as mic tail capture finishes (before LLM polishing)!
-        audioDucker.restoreIfNeeded()
+        restoreSystemAudio()
+        // Stop cue: right after the output is restored (a muted device would swallow it) and before any cleanup work.
+        playSessionCue(.stop)
         let sessionUsedPunctuatedCloudASR = asrEngine.activeSessionUsesAnyCloudASR
         if asrEngine.activeSessionUsesOpenAIASR {
-            phase = .polishing(rawText: "云端语音转写中…")
+            phase = .polishing(rawText: "Transcribing in the cloud…")
         }
         let (rawText, duration) = await asrEngine.finishStreaming()
         guard !rawText.isEmpty else {
@@ -1610,6 +1173,20 @@ public final class AppState: ObservableObject {
             } else {
                 phase = .idle
             }
+            return
+        }
+
+        // Nothing but filler sounds ("uh", "um", "嗯") and punctuation: skip the model and the fast path, insert nothing (and take
+        // back anything already typed live), keep no history entry, and say so briefly.
+        if PolishEngine.isFillerOnlyTranscript(rawText) {
+            if isTypingInsideOwnApp {
+                sandboxText = sandboxBaseBeforeSession
+            } else {
+                _ = liveInputSession?.updateLiveText("")
+            }
+            liveInputSession = nil
+            phase = .error(message: DictationFailure.noSpeechPillText)
+            scheduleIdleReset(after: DictationFailure.noSpeechDisplaySeconds)
             return
         }
 
@@ -1630,20 +1207,15 @@ public final class AppState: ObservableObject {
             limit: 26
         )
         let recentTexts = history.prefix(3).map(\.polishedText).reversed() as [String]
-        var effectiveConfig = llmConfig
+        let effectiveConfig = llmConfig
         var key = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isOfficialCloudTrialActive {
-            effectiveConfig.selectedProvider = .deepseek
-            effectiveConfig.baseURL = CloudAuthClient.cloudLLMBaseURL
-            effectiveConfig.modelName = "deepseek-flash"
-            key = KeychainHelper.loadCloudJWT().trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if key.isEmpty {
+        if key.isEmpty {
             key = KeychainHelper.loadAPIKey(for: effectiveConfig.selectedProvider)
         }
         if key.isEmpty
             && !PolishEngine.isKeylessLocalEndpoint(effectiveConfig.baseURL)
             && effectiveConfig.formattingStyle != .verbatimLocal {
-            statusBanner = "⚠️ 当前生效的「\(effectiveConfig.selectedProvider.shortName)」尚未填入 API Key，本次仅执行本地词库纠偏"
+            statusBanner = "⚠️ No API key for the active \(effectiveConfig.selectedProvider.shortName) provider; only your local dictionary was applied this time"
         }
 
         phase = .polishing(rawText: tailFixed)
@@ -1654,7 +1226,7 @@ public final class AppState: ObservableObject {
             && (liveInputSession?.prepareForSSEPolishStream() == true)
         var didStreamViaSSE = false
 
-        let (finalText, polishMs, _) = await polishEngine.polish(
+        let polishOutcome = await polishEngine.polishWithDiagnostics(
             rawTranscript: rawText,
             mode: activeMode,
             screenContext: activeContext,
@@ -1662,7 +1234,8 @@ public final class AppState: ObservableObject {
             recentOutputs: recentTexts,
             config: effectiveConfig,
             apiKey: key,
-            isHighAccuracyLocalASR: asrEngine.isUsingSenseVoice,
+            // Parakeet TDT v2 and SenseVoice both count as high-accuracy local ASR.
+            isHighAccuracyLocalASR: asrEngine.activeLocalModel != nil,
             isPunctuatedCloudASR: sessionUsedPunctuatedCloudASR,
             onStreamChunk: { [weak self] chunk, isFirst in
                 guard let self else { return }
@@ -1680,20 +1253,17 @@ public final class AppState: ObservableObject {
             }
         )
 
+        let finalText = polishOutcome.text
+        let polishMs = polishOutcome.latencyMs
+        if polishOutcome.route == .llmFailedFallback {
+            // Make an unreachable / timed-out cleanup model visible instead of silently pasting the raw transcript.
+            statusBanner = "⚠️ Cleanup model unavailable (\(polishOutcome.llmError ?? "unknown error")) — inserted the raw transcript instead."
+        }
+
         guard !finalText.isEmpty else {
             liveInputSession = nil
             phase = .idle
             return
-        }
-
-        if isOfficialCloudTrialActive {
-            Task { [weak self] in
-                await self?.refreshCloudAccount()
-            }
-        } else if isUsingDoubaoVoucher && llmConfig.asrProvider == .volcSeedASR {
-            Task { [weak self] in
-                await self?.refreshVoucherStatusIfApplicable(notifyUserOnLowOrExhausted: true)
-            }
         }
 
         var landedInInput = true
@@ -1725,7 +1295,7 @@ public final class AppState: ObservableObject {
         // Voice Teach-in Loop: when user selected wrong text and pressed Fn to fix it, permanently learn the correction!
         if activeMode == .rewriteSelection && llmConfig.enableAutoLearn {
             if let taught = lexiconStore.learnFromSelectionRewrite(selectedText: activeContext.selectedText, rewrittenText: finalText) {
-                statusBanner = "✨ 语音纠偏已永久记入词库：「\(taught.wrong)」➔「\(taught.corrected)」"
+                statusBanner = "✨ Voice correction saved to your dictionary: \"\(taught.wrong)\" ➔ \"\(taught.corrected)\""
             }
         }
 
@@ -1734,7 +1304,7 @@ public final class AppState: ObservableObject {
             polishedText: finalText,
             durationSeconds: duration,
             polishLatencyMs: polishMs,
-            targetAppName: isTypingInsideOwnApp ? "TypeZero 试音沙盒" : activeContext.appName,
+            targetAppName: isTypingInsideOwnApp ? "\(AppBrand.name) Sandbox" : activeContext.appName,
             mode: activeMode,
             matchedTerms: recalled.prefix(5).map(\.term)
         )
@@ -1745,11 +1315,10 @@ public final class AppState: ObservableObject {
         saveHistory()
 
         liveInputSession = nil
-        playSubtleCue("Pop", volume: 0.26)
 
         if !landedInInput {
             // P4 Safety Vault triggered: user wasn't focused inside an input field!
-            phase = .savedToClipboard(textPreview: "已暂存剪贴板 · Cmd+V 粘贴")
+            phase = .savedToClipboard(textPreview: "Copied · Cmd+V to paste")
             scheduleIdleReset(after: 2.6)
         } else {
             phase = .completed(finalText: finalText, latencyMs: polishMs)
@@ -1783,16 +1352,28 @@ public final class AppState: ObservableObject {
                 guard let boxVal = editedBox, !boxVal.isEmpty else { continue }
 
                 if let learned = self.lexiconStore.learnFromManualEditIfApplicable(injectedText: injectedText, editedBoxValue: boxVal) {
-                    self.statusBanner = "✨ 自学习词典已自动记住纠偏：「\(learned.wrong)」➔「\(learned.corrected)」"
+                    self.statusBanner = "✨ Learned from your edit: \"\(learned.wrong)\" ➔ \"\(learned.corrected)\""
                     return
                 }
             }
         }
     }
 
+    /// Shows why dictation failed: the short reason in the floating pill for `DictationFailure.displaySeconds`, and the
+    /// full explanation in the main window banner so it is still there when the window is opened afterwards.
+    private func showDictationFailure(_ failure: DictationFailure) {
+        phase = .error(message: failure.pillText)
+        statusBanner = failure.bannerText
+        scheduleIdleReset(after: DictationFailure.displaySeconds)
+    }
+
+    /// Returns the pill to idle after `seconds`. Only the latest call counts: an earlier timer must not cut a newer
+    /// error short (for example when the shortcut is pressed again while an error is still showing).
     private func scheduleIdleReset(after seconds: Double) {
-        Task { @MainActor in
+        idleResetTask?.cancel()
+        idleResetTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
             if case .listening = self.phase { return }
             if case .polishing = self.phase { return }
             self.phase = .idle
@@ -1808,9 +1389,9 @@ public final class AppState: ObservableObject {
                 apiKey: key
             )
             let count = lexiconStore.bulkUpsert(extracted)
-            statusBanner = "智能蒸馏完成：新增 \(count) 个专属词条（总词库 \(lexiconStore.entries.count) 词）"
+            statusBanner = "Extraction complete: \(count) new terms added (\(lexiconStore.entries.count) total)"
         } catch {
-            statusBanner = "蒸馏失败：\(error.localizedDescription)"
+            statusBanner = "Extraction failed: \(error.localizedDescription)"
         }
     }
 

@@ -11,9 +11,9 @@ public enum RecordedShortcutResult: Equatable, Sendable {
 
 /// Supports all Left & Right macOS single-modifier keys (`Fn`, `Left/Right Option`, `Left/Right Command`,
 /// `Left/Right Control`, `Left/Right Shift`), `Option + Space`, and arbitrary custom Carbon combos,
-/// in both Tap-to-Toggle and Hold-to-Talk modes, while ignoring TypeZero's own synthetic typewriter keystrokes (`0x545A_5359`).
+/// in both Tap-to-Toggle and Hold-to-Talk modes, while ignoring the app's own synthetic typewriter keystrokes (`0x545A_5359`).
 public final class HotkeyMonitor {
-    /// Magic marker stamped onto every synthetic CGEvent emitted by TypeZero so HotkeyMonitor NEVER confuses live typing with user combo keys!
+    /// Magic marker stamped onto every synthetic CGEvent emitted by this app so HotkeyMonitor NEVER confuses live typing with user combo keys!
     public static let syntheticEventMarker: Int64 = 0x545A_5359
 
     // IOKit `<IOKit/hidsystem/IOLLEvent.h>` device-dependent Left / Right modifier bitmasks
@@ -54,7 +54,7 @@ public final class HotkeyMonitor {
     public var onTriggerStop: (() -> Void)?
     public var onCancel: (() -> Void)?
     /// Fires when the user physically presses bare `Return` / `Numpad Enter` / `Cmd+Return` (not Shift/Opt newline),
-    /// allowing TypeZero to immediately abort post-polish pasting if the user already sent the message!
+    /// allowing the app to immediately abort post-polish pasting if the user already sent the message!
     public var onUserSubmitKeyPressed: (() -> Void)?
 
     private var isStarted: Bool = false

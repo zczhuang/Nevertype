@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://typezero.mykkai.com/sitemap.xml

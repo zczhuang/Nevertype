@@ -61,6 +61,30 @@ public final class AudioLevelBus: @unchecked Sendable {
     }
 }
 
+/// Geometry of the floating pill window. The panel has a fixed size and the SwiftUI pill is centred inside it, so
+/// everything drawn in an error state has to fit these numbers.
+enum FloatingPillLayout {
+    /// Fixed size of the pill's `NSPanel`, in points.
+    static let panelSize = CGSize(width: 224, height: 58)
+
+    // Error pill: orange triangle plus the reason, wrapped to at most `errorMaxLines` lines.
+    /// Widest the error capsule may get; the panel width minus a 4 pt margin on each side.
+    static let errorMaxWidth: CGFloat = 216
+    static let errorFontSize: CGFloat = 10.5
+    static let errorMaxLines = 2
+    static let errorIconSize: CGFloat = 12
+    static let errorIconSpacing: CGFloat = 6
+    static let errorHorizontalPadding: CGFloat = 13
+    static let errorVerticalPadding: CGFloat = 7
+    /// Shortest the error capsule gets (a single line of text or the icon alone), as in the old icon-only pill.
+    static let errorMinHeight: CGFloat = 28
+
+    /// Height of a full error pill (`errorMaxLines` lines of text), with the font's line height taken as 1.25 x its size.
+    static var errorMaxHeightEstimate: CGFloat {
+        CGFloat(errorMaxLines) * (errorFontSize * 1.25) + 2 * errorVerticalPadding
+    }
+}
+
 /// Ultra-minimalist, zero-text floating acoustic micro-pill:
 /// - Strictly NEVER displays live transcribed text (text streams exclusively inside the user's selected input box!).
 /// - Decouples Accessibility IPC caret queries onto a background serial queue (zero main-thread stalls!).
@@ -76,7 +100,7 @@ public final class FloatingPillController: @unchecked Sendable {
     private var cachedTargetOrigin: CGPoint? = nil
     private var currentOrigin: CGPoint = .zero
     private var isRequestedVisible: Bool = false
-    private let pillSize = CGSize(width: 224, height: 58)
+    private let pillSize = FloatingPillLayout.panelSize
 
     public init() {}
 
@@ -242,58 +266,6 @@ public final class FloatingPillController: @unchecked Sendable {
     }
 }
 
-/// Custom vector Möbius Strip brand mark.
-public struct MobiusMarkView: View {
-    public var size: CGFloat = 24
-
-    public init(size: CGFloat = 24) {
-        self.size = size
-    }
-
-    public var body: some View {
-        Canvas { context, canvasSize in
-            let w = canvasSize.width
-            let h = canvasSize.height
-            let cx = w * 0.5
-            let cy = h * 0.52
-            let rx = w * 0.38
-            let ry = h * 0.24
-
-            var backLoop = Path()
-            let steps = 90
-            for i in 0...steps {
-                let t = Double(i) / Double(steps) * Double.pi * 2.0
-                let denom = 1.0 + pow(sin(t), 2)
-                let x = cx + rx * CGFloat(cos(t) / denom)
-                let y = cy + ry * 1.55 * CGFloat((sin(t) * cos(t)) / denom)
-                if i == 0 {
-                    backLoop.move(to: CGPoint(x: x, y: y))
-                } else {
-                    backLoop.addLine(to: CGPoint(x: x, y: y))
-                }
-            }
-            backLoop.closeSubpath()
-
-            let grad = GraphicsContext.Shading.linearGradient(
-                Gradient(colors: [
-                    Color(red: 0.353, green: 0.275, blue: 0.910), // #5A46E8 Royal Violet
-                    Color(red: 0.486, green: 0.345, blue: 0.949),
-                    Color(red: 0.220, green: 0.490, blue: 0.960)
-                ]),
-                startPoint: CGPoint(x: w * 0.12, y: h * 0.25),
-                endPoint: CGPoint(x: w * 0.88, y: h * 0.75)
-            )
-
-            context.stroke(
-                backLoop,
-                with: grad,
-                style: StrokeStyle(lineWidth: max(2.2, size * 0.145), lineCap: .round, lineJoin: .round)
-            )
-        }
-        .frame(width: size, height: size)
-    }
-}
-
 /// Pure acoustic wave micro-capsule — ZERO live text duplication, ZERO per-frame SwiftUI state invalidations!
 struct FloatingPillView: View {
     @ObservedObject var appState: AppState
@@ -307,18 +279,18 @@ struct FloatingPillView: View {
             case .listening(_, let mode):
                 let accentColor = mode == .rewriteSelection
                     ? Color(red: 0.56, green: 0.24, blue: 0.88)
-                    : Color(red: 0.353, green: 0.275, blue: 0.910)
+                    : TZTheme.blue
 
                 if appState.llmConfig.enableLiveInlineTyping || mode == .rewriteSelection {
                     HStack(spacing: 9) {
-                        MobiusMarkView(size: 16)
+                        NevertypeMarkView(size: 16)
                         FluidSineWaveView(accent: accentColor)
                             .frame(width: 62, height: 16)
                     }
                     .padding(.horizontal, 13)
                     .frame(height: 31)
                     .background(.ultraThinMaterial)
-                    .background(Color(red: 0.988, green: 0.984, blue: 0.973).opacity(0.94))
+                    .background(Color(red: 0.980, green: 0.980, blue: 0.984).opacity(0.94))
                     .clipShape(Capsule())
                     .overlay(Capsule().strokeBorder(Color(red: 0.09, green: 0.086, blue: 0.106).opacity(0.10), lineWidth: 0.8))
                 } else {
@@ -326,7 +298,7 @@ struct FloatingPillView: View {
                     VStack(spacing: 4) {
                         MicroSymbolStreamView(accent: accentColor)
                         HStack(spacing: 8) {
-                            MobiusMarkView(size: 14)
+                            NevertypeMarkView(size: 14)
                             FluidSineWaveView(accent: accentColor)
                                 .frame(width: 86, height: 14)
                         }
@@ -334,7 +306,7 @@ struct FloatingPillView: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6.5)
                     .background(.ultraThinMaterial)
-                    .background(Color(red: 0.988, green: 0.984, blue: 0.973).opacity(0.95))
+                    .background(Color(red: 0.980, green: 0.980, blue: 0.984).opacity(0.95))
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -343,16 +315,7 @@ struct FloatingPillView: View {
                 }
 
             case .polishing:
-                HStack(spacing: 8) {
-                    MobiusMarkView(size: 15)
-                    ShimmerDotsView()
-                }
-                .padding(.horizontal, 13)
-                .frame(height: 29)
-                .background(.ultraThinMaterial)
-                .background(Color(red: 0.988, green: 0.984, blue: 0.973).opacity(0.95))
-                .clipShape(Capsule())
-                .overlay(Capsule().strokeBorder(Color(red: 0.353, green: 0.275, blue: 0.910).opacity(0.22), lineWidth: 0.8))
+                FloatingPillThinkingView()
 
             case .completed:
                 HStack(spacing: 5) {
@@ -382,20 +345,73 @@ struct FloatingPillView: View {
                 .clipShape(Capsule())
                 .overlay(Capsule().strokeBorder(Color(red: 0.10, green: 0.42, blue: 1.0).opacity(0.3), lineWidth: 0.8))
 
-            case .error:
-                HStack(spacing: 5) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color.orange)
-                }
-                .padding(.horizontal, 10)
-                .frame(height: 28)
-                .background(Color.white.opacity(0.96))
-                .clipShape(Capsule())
-                .overlay(Capsule().strokeBorder(Color.orange.opacity(0.4), lineWidth: 0.8))
+            case .error(let message):
+                FloatingPillErrorView(message: message)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Capsule shown while the transcript is cleaned up (and while a cloud engine transcribes): logo, "Thinking", animated dots.
+/// About 125 pt wide and 30 pt tall, centred in the 224 x 58 pt panel.
+struct FloatingPillThinkingView: View {
+    /// Pass an empty label for the logo-and-dots-only capsule (the self-tests use it to measure what the word adds).
+    var label: String = "Thinking"
+
+    var body: some View {
+        HStack(spacing: 8) {
+            NevertypeMarkView(size: 15)
+            if !label.isEmpty {
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TZTheme.inkBody)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            ShimmerDotsView()
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 30)
+        .background(.ultraThinMaterial)
+        .background(Color(red: 0.980, green: 0.980, blue: 0.984).opacity(0.95))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(TZTheme.blue.opacity(0.22), lineWidth: 0.8))
+    }
+}
+
+/// Error capsule: orange triangle plus the reason (for example "Allow microphone access in System Settings").
+///
+/// The text wraps to at most `FloatingPillLayout.errorMaxLines` lines and ends with an ellipsis beyond that. The panel
+/// ignores mouse events (clicks must reach the app underneath), so this view is read-only.
+struct FloatingPillErrorView: View {
+    let message: String
+
+    private var reason: String { message.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        HStack(spacing: FloatingPillLayout.errorIconSpacing) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: FloatingPillLayout.errorIconSize))
+                .foregroundStyle(Color.orange)
+            if !reason.isEmpty {
+                Text(reason)
+                    .font(.system(size: FloatingPillLayout.errorFontSize, weight: .semibold))
+                    .foregroundStyle(Color(red: 0.10, green: 0.10, blue: 0.14))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(FloatingPillLayout.errorMaxLines)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, reason.isEmpty ? 10 : FloatingPillLayout.errorHorizontalPadding)
+        .padding(.vertical, FloatingPillLayout.errorVerticalPadding)
+        .frame(minHeight: FloatingPillLayout.errorMinHeight)
+        .background(Color.white.opacity(0.96))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(Color.orange.opacity(0.4), lineWidth: 0.8))
+        // Caps the width the capsule may use. The capsule itself still hugs its content inside this frame.
+        .frame(maxWidth: FloatingPillLayout.errorMaxWidth)
     }
 }
 
@@ -408,7 +424,7 @@ struct ShimmerDotsView: View {
                 ForEach(0..<3, id: \.self) { idx in
                     let wave = (sin(t - Double(idx) * 0.85) + 1.0) * 0.5
                     Circle()
-                        .fill(Color(red: 0.353, green: 0.275, blue: 0.910).opacity(0.35 + wave * 0.65))
+                        .fill(TZTheme.blue.opacity(0.35 + wave * 0.65))
                         .frame(width: 4.5, height: 4.5)
                         .offset(y: CGFloat((wave - 0.5) * -3.0))
                 }

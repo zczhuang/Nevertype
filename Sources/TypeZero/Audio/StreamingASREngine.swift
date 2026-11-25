@@ -7,6 +7,9 @@ import CSherpaOnnx
 /// Uses real-time Voice Activity Detection (VAD) to detect natural breath pauses (~420ms silence),
 /// commits completed clauses into `frozenTranscriptPrefix`, and IMMEDIATELY flushes `activeSegmentSamples`!
 /// Guarantees constant ~25ms inference speed and flat memory even if you dictate non-stop for 30+ minutes.
+///
+/// NOTE: despite the legacy `senseVoice*` names, `senseVoiceHandle` / `isUsingSenseVoice` / `runSenseVoice` are generic over
+/// whichever local sherpa-onnx recognizer is active (`activeLocalModel`: Parakeet TDT v2 or SenseVoice).
 public final class StreamingASREngine: NSObject, @unchecked Sendable {
     private var audioEngine: AVAudioEngine?
     private var senseVoiceHandle: OpaquePointer?
@@ -48,8 +51,13 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
     private var latestTranscript: String = ""
     private var sessionStartTime: Date = Date()
 
+    /// True whenever ANY local model (Parakeet or SenseVoice) is loaded.
     public private(set) var isUsingSenseVoice: Bool = false
     public private(set) var isFullPrecisionFP32: Bool = false
+    /// The local model currently loaded in the handle slot (may differ from `localASRModel` when the selected one is not installed).
+    public private(set) var activeLocalModel: LocalASRModel?
+    /// User-selected local model (synced from `LLMConfig.localASRModel`).
+    public var localASRModel: LocalASRModel = .default
     public private(set) var activeSessionUsesCloudSeedASR: Bool = false
     public private(set) var activeSessionUsesOpenAIASR: Bool = false
     public var activeSessionUsesAnyCloudASR: Bool {
@@ -61,8 +69,6 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         set { asrProvider = newValue ? .volcSeedASR : .localSenseVoice }
     }
     public var volcSpeechAPIKey: String = ""
-    public var useCloudTrialRelay: Bool = false
-    public var cloudTrialJWT: String = ""
     public var openAIASRBaseURL: String = "https://api.openai.com/v1"
     public var openAIASRModel: String = "gpt-4o-mini-transcribe"
     public var openAIASRAPIKey: String = ""
@@ -76,6 +82,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
     private var openAIActiveHotwords: [String] = []
     private var openAIActiveLocale: String = "auto"
     private var loadedSenseVoiceLanguage: String = ""
+    private var loadedLocalModel: LocalASRModel?
     /// Rolling 220ms pre-roll ring buffer captured while mic is hot-standby (KeyDown / 15s keep-alive)
     /// so the very first syllable spoken right at keypress is NEVER clipped!
     private var preRollSamples: [Float] = []
@@ -136,12 +143,28 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         }
     }
 
+    // MARK: Apple Speech fallback (on-device only)
+
+    /// Why the macOS speech fallback may not be used (nil when it may). It is allowed only when macOS can recognize speech on
+    /// this Mac: a recognizer that needs Apple's servers (no on-device support for the language, or the on-device assets
+    /// missing) is refused, and so is one that is not ready. Never fall back to server recognition.
+    static func appleFallbackFailure(isAvailable: Bool, supportsOnDeviceRecognition: Bool) -> DictationFailure? {
+        (isAvailable && supportsOnDeviceRecognition) ? nil : DictationFailure.onDeviceSpeechUnavailable
+    }
+
+    /// The only place a fallback recognition request is set up: it must never be sent to Apple's servers.
+    static func configureAppleFallbackRequest(_ request: SFSpeechAudioBufferRecognitionRequest, contextualStrings: [String]) {
+        request.shouldReportPartialResults = true
+        request.requiresOnDeviceRecognition = true
+        request.contextualStrings = contextualStrings
+    }
+
     public static var isMicrophoneAuthorized: Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     }
 
     public static var isSpeechAuthorized: Bool {
-        if senseVoiceModelPaths() != nil
+        if LocalASRModel.anyInstalled()
             || KeychainHelper.hasAnyDoubaoCredential
             || !KeychainHelper.loadEffectiveOpenAIASRAPIKey().isEmpty {
             return true
@@ -150,49 +173,52 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
     }
 
     public static func senseVoiceModelPaths() -> (model: String, tokens: String, isFullFP32: Bool)? {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-        let modelsRoot = appSupport.appendingPathComponent("TypeZero/Models", isDirectory: true)
-
-        // Priority 1: Lossless Full-Precision FP32 model (~930MB) for maximum acoustic & sibilant accuracy!
-        let fp32Dir = modelsRoot.appendingPathComponent("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2025-09-09", isDirectory: true)
-        let fp32Model = fp32Dir.appendingPathComponent("model.onnx").path
-        let fp32Tokens = fp32Dir.appendingPathComponent("tokens.txt").path
-        if FileManager.default.fileExists(atPath: fp32Model) && FileManager.default.fileExists(atPath: fp32Tokens) {
-            return (fp32Model, fp32Tokens, true)
-        }
-
-        // Priority 2: Compact int8 quantized fallback (~226MB)
-        let int8Dir = modelsRoot.appendingPathComponent("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09", isDirectory: true)
-        let int8Model = int8Dir.appendingPathComponent("model.int8.onnx").path
-        let int8Tokens = int8Dir.appendingPathComponent("tokens.txt").path
-        if FileManager.default.fileExists(atPath: int8Model) && FileManager.default.fileExists(atPath: int8Tokens) {
-            return (int8Model, int8Tokens, false)
-        }
-        return nil
+        guard let files = LocalASRModel.senseVoice.installedFiles() else { return nil }
+        return (files.modelPath, files.tokensPath, files.isFullPrecision)
     }
 
+    /// Creates a recognizer handle for resolved model files. This is the single construction path shared by the app engine
+    /// and the headless `--dictate-file` CLI; the returned handle works with `tz_sensevoice_transcribe` for both models.
+    public static func createLocalRecognizerHandle(files: LocalASRModelFiles, speechLocale: String) -> OpaquePointer? {
+        switch files.model {
+        case .parakeetTDTv2:
+            guard let decoder = files.decoderPath, let joiner = files.joinerPath else { return nil }
+            // English-only model: `speechLocale` is ignored. 4 threads decode as fast as 8 on Apple Silicon.
+            return tz_parakeet_create(files.modelPath, decoder, joiner, files.tokensPath, 4)
+        case .senseVoice:
+            let maxThreads = files.isFullPrecision ? 8 : 6
+            let threads = Int32(max(4, min(maxThreads, ProcessInfo.processInfo.activeProcessorCount - 2)))
+            return tz_sensevoice_create(files.modelPath, files.tokensPath, threads, LLMConfig.senseVoiceLanguageCode(for: speechLocale))
+        }
+    }
+
+    /// Loads the selected local model into the handle slot. If its files are missing the other installed model is used;
+    /// if none is installed the current state is left untouched.
     public func loadSenseVoiceIfAvailable() {
         modelInitLock.lock()
         defer { modelInitLock.unlock() }
 
         let targetLang = LLMConfig.senseVoiceLanguageCode(for: speechLocale)
-        if senseVoiceHandle != nil && loadedSenseVoiceLanguage == targetLang {
-            isUsingSenseVoice = true
-            return
-        }
-        guard let paths = Self.senseVoiceModelPaths() else {
-            isUsingSenseVoice = (senseVoiceHandle != nil)
-            return
-        }
-        let maxThreads = paths.isFullFP32 ? 8 : 6
-        let threads = Int32(max(4, min(maxThreads, ProcessInfo.processInfo.activeProcessorCount - 2)))
-        if let handle = tz_sensevoice_create(paths.model, paths.tokens, threads, targetLang) {
+        let ordered = [localASRModel] + LocalASRModel.allCases.filter { $0 != localASRModel }
+        for candidate in ordered {
+            guard let files = candidate.installedFiles() else { continue }
+
+            // Already loaded and still current (SenseVoice additionally depends on the language token).
+            if senseVoiceHandle != nil,
+               loadedLocalModel == candidate,
+               (candidate != .senseVoice || loadedSenseVoiceLanguage == targetLang) {
+                isUsingSenseVoice = true
+                return
+            }
+
+            guard let handle = Self.createLocalRecognizerHandle(files: files, speechLocale: speechLocale) else { continue }
             let oldHandleBits = senseVoiceHandle.map { Int(bitPattern: $0) }
             self.senseVoiceHandle = handle
-            self.loadedSenseVoiceLanguage = targetLang
+            self.loadedLocalModel = candidate
+            self.activeLocalModel = candidate
+            self.loadedSenseVoiceLanguage = (candidate == .senseVoice) ? targetLang : ""
             self.isUsingSenseVoice = true
-            self.isFullPrecisionFP32 = paths.isFullFP32
+            self.isFullPrecisionFP32 = files.isFullPrecision
             if let bits = oldHandleBits {
                 decodeQueue.async {
                     if let oldPtr = OpaquePointer(bitPattern: bits) {
@@ -203,7 +229,9 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 self?.onModelReady?()
             }
+            return
         }
+        isUsingSenseVoice = (senseVoiceHandle != nil)
     }
 
     public func reloadSenseVoiceModelAsync() {
@@ -214,7 +242,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
 
     public static func requestPermissions(completion: @escaping (Bool, Bool) -> Void) {
         AVCaptureDevice.requestAccess(for: .audio) { micGranted in
-            if senseVoiceModelPaths() != nil
+            if LocalASRModel.anyInstalled()
                 || KeychainHelper.hasAnyDoubaoCredential
                 || !KeychainHelper.loadEffectiveOpenAIASRAPIKey().isEmpty {
                 DispatchQueue.main.async {
@@ -317,7 +345,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
-            throw NSError(domain: "TypeZero.ASR", code: -2, userInfo: [NSLocalizedDescriptionKey: "麦克风输入不可用，请检查麦克风权限"])
+            throw NSError(domain: "TypeZero.ASR", code: -2, userInfo: [NSLocalizedDescriptionKey: "Microphone input is unavailable. Check microphone permissions."])
         }
 
         let hwRate = Int32(recordingFormat.sampleRate)
@@ -446,11 +474,9 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         sessionStartTime = Date()
 
         let cleanSpeechKey = volcSpeechAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanCloudJWT = cloudTrialJWT.trimmingCharacters(in: .whitespacesAndNewlines)
-        let useCloudASR = useCloudTrialRelay && !cleanCloudJWT.isEmpty
         let cleanOpenAIKey = openAIASRAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let wantCloudSeedASR = useCloudASR || ((asrProvider == .volcSeedASR) && !cleanSpeechKey.isEmpty)
-        let wantOpenAIASR = !useCloudASR && (asrProvider == .openAIWhisper) && (!cleanOpenAIKey.isEmpty || PolishEngine.isKeylessLocalEndpoint(openAIASRBaseURL))
+        let wantCloudSeedASR = (asrProvider == .volcSeedASR) && !cleanSpeechKey.isEmpty
+        let wantOpenAIASR = (asrProvider == .openAIWhisper) && (!cleanOpenAIKey.isEmpty || PolishEngine.isKeylessLocalEndpoint(openAIASRBaseURL))
         let hasLocalSenseVoice = isUsingSenseVoice && (senseVoiceHandle != nil)
 
         if wantCloudSeedASR || wantOpenAIASR || hasLocalSenseVoice {
@@ -472,29 +498,11 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             let isAnyCloudMode = wantCloudSeedASR || wantOpenAIASR
 
             if wantCloudSeedASR {
-                if useCloudASR {
-                    seedASRClient.startSession(
-                        apiKey: cleanCloudJWT,
-                        hotwords: contextualStrings,
-                        dialogContext: dialogContext,
-                        customEndpointURL: CloudAuthClient.cloudASRWSURL,
-                        useBearerAuth: true
-                    )
-                } else if CloudAuthClient.isVoucherCode(cleanSpeechKey) {
-                    seedASRClient.startSession(
-                        apiKey: CloudAuthClient.normalizedVoucherCode(cleanSpeechKey),
-                        hotwords: contextualStrings,
-                        dialogContext: dialogContext,
-                        customEndpointURL: CloudAuthClient.cloudASRWSURL,
-                        useBearerAuth: true
-                    )
-                } else {
-                    seedASRClient.startSession(
-                        apiKey: cleanSpeechKey,
-                        hotwords: contextualStrings,
-                        dialogContext: dialogContext
-                    )
-                }
+                seedASRClient.startSession(
+                    apiKey: cleanSpeechKey,
+                    hotwords: contextualStrings,
+                    dialogContext: dialogContext
+                )
             } else if wantOpenAIASR {
                 openAIASRClient.prewarmConnection(baseURL: openAIASRBaseURL, apiKey: cleanOpenAIKey)
             }
@@ -554,27 +562,34 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             return
         }
 
-        // Fallback Apple Speech
+        // Fallback: macOS speech recognition, on this Mac only. It is used when no speech model is installed, and it never goes
+        // to Apple's servers: if macOS cannot recognize speech on-device here, dictation stops with a pointer to the speech
+        // models in Settings. Checked before the microphone is touched.
+        let trimmedLoc = localeIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = (trimmedLoc.isEmpty || trimmedLoc.lowercased() == "auto")
+            ? SFSpeechRecognizer()
+            : (SFSpeechRecognizer(locale: Locale(identifier: trimmedLoc)) ?? SFSpeechRecognizer())
+        let fallbackFailure = Self.appleFallbackFailure(
+            isAvailable: candidate?.isAvailable ?? false,
+            supportsOnDeviceRecognition: candidate?.supportsOnDeviceRecognition ?? false
+        )
+        guard fallbackFailure == nil, let recognizer = candidate else {
+            let message = (fallbackFailure ?? DictationFailure.onDeviceSpeechUnavailable).detail
+            throw NSError(domain: "TypeZero.ASR", code: -3, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
         shutdownAudioHardwareCompletely()
         let engine = AVAudioEngine()
         self.audioEngine = engine
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
-            throw NSError(domain: "TypeZero.ASR", code: -2, userInfo: [NSLocalizedDescriptionKey: "麦克风输入不可用，请检查麦克风权限"])
-        }
-        let trimmedLoc = localeIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
-        let recognizer = (trimmedLoc.isEmpty || trimmedLoc.lowercased() == "auto")
-            ? SFSpeechRecognizer()
-            : (SFSpeechRecognizer(locale: Locale(identifier: trimmedLoc)) ?? SFSpeechRecognizer())
-        guard let recognizer, recognizer.isAvailable else {
-            throw NSError(domain: "TypeZero.ASR", code: -1, userInfo: [NSLocalizedDescriptionKey: "未找到本地模型且系统听写未就绪"])
+            throw NSError(domain: "TypeZero.ASR", code: -2, userInfo: [NSLocalizedDescriptionKey: "Microphone input is unavailable. Check microphone permissions."])
         }
         self.fallbackRecognizer = recognizer
 
         let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.contextualStrings = contextualStrings
+        Self.configureAppleFallbackRequest(request, contextualStrings: contextualStrings)
         self.fallbackRequest = request
 
         inputNode.installTap(onBus: 0, bufferSize: 512, format: recordingFormat) { [weak self] buffer, _ in
@@ -629,7 +644,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
 
         // Dead-Wi-Fi / Captive Portal Blackhole Guard: if >= 1.5s of voice elapsed with zero server packets, fail over to local FP32!
         if activeVoiceSeconds >= 1.50 && !seedASRClient.hasReceivedAnyServerFrame && senseVoiceHandle != nil {
-            switchActiveSessionFromCloudToLocalFP32(reason: "弱网超时，已自动无损切回本机满血模型")
+            switchActiveSessionFromCloudToLocalFP32(reason: "the network timed out (no audio lost)")
             return
         }
 
@@ -754,6 +769,18 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         timer.resume()
     }
 
+    /// Minimum amount of NEW audio (in samples at `sampleRate`) that must arrive before the live preview re-decodes the active segment.
+    /// SenseVoice decodes in ~15 ms, so a ~55 ms step keeps its preview feeling instant. Parakeet needs 0.05-0.33 s per decode of the
+    /// whole active segment: with a 55 ms step it would decode back-to-back for the entire utterance, and the final decode after key
+    /// release would queue behind an in-flight preview decode on the single decode queue. ~0.35 s of new audio keeps that queue mostly idle.
+    static func livePreviewMinStepSamples(sampleRate: Int, model: LocalASRModel?) -> Int {
+        let sr = max(1, sampleRate)
+        if model == .parakeetTDTv2 {
+            return sr * 7 / 20   // 0.35 s, in integer math so 48 kHz gives exactly 16_800 samples
+        }
+        return sr / 18           // ~55 ms
+    }
+
     /// Core VAD + Sliding Segment Engine:
     /// 1. Releases the withheld final character immediately on a >=180ms micro-pause so sentence endings never hang!
     /// 2. Seals & flushes `activeSegmentSamples` on >=420ms breath pause (or >=6.8s with >=150ms micro-pause) so active window stays <6.8s (~15ms constant inference!).
@@ -802,10 +829,11 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
 
                 self.sampleLock.lock()
                 if !segText.isEmpty {
-                    self.frozenTranscriptPrefix += segText
-                    // Preserve acoustic pause cue for downstream LLM paragraph/list structuring if SenseVoice didn't append punctuation
+                    self.frozenTranscriptPrefix = Self.joinTranscriptFragments(self.frozenTranscriptPrefix, segText)
+                    // Preserve acoustic pause cue for downstream LLM paragraph/list structuring if the model didn't append punctuation
                     if wasLongPause, let last = segText.last, !"。！？；，,.;!?".contains(last) {
-                        self.frozenTranscriptPrefix += "，"
+                        // Parakeet (English) gets an ASCII comma; SenseVoice keeps the original full-width one.
+                        self.frozenTranscriptPrefix += (self.activeLocalModel == .parakeetTDTv2) ? "," : "，"
                     }
                 }
                 let fullCombined = self.frozenTranscriptPrefix
@@ -835,8 +863,9 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             return
         }
 
-        // Ongoing active speech within current short segment: decode live preview every ~55ms of new audio!
-        let minStep = sr / 18
+        // Ongoing active speech within current short segment: decode a live preview whenever enough NEW audio arrived
+        // (~55ms for SenseVoice, ~0.35s for Parakeet; see `livePreviewMinStepSamples`).
+        let minStep = Self.livePreviewMinStepSamples(sampleRate: sr, model: activeLocalModel)
         guard hasDetectedSpeechInSegment,
               totalSamples >= sr / 9,
               (totalSamples - lastDecodedSampleCount) >= minStep else {
@@ -866,7 +895,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             self.sampleLock.unlock()
 
             guard latestFrozen == prefixCopy, !activeText.isEmpty else { return }
-            let combined = latestFrozen + activeText
+            let combined = Self.joinTranscriptFragments(latestFrozen, activeText)
 
             DispatchQueue.main.async {
                 guard self.audioEngine?.isRunning == true else { return }
@@ -963,7 +992,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
                     if !localFallback.isEmpty {
                         let shortErr = error.localizedDescription
                         DispatchQueue.main.async { [weak self] in
-                            self?.onCloudFailoverNotice?("云端语音回包异常（\(shortErr)），已由本机满血 FP32 模型无缝兜底")
+                            self?.onCloudFailoverNotice?("the cloud speech service returned an error (\(shortErr))")
                         }
                         return (localFallback, elapsed)
                     }
@@ -971,7 +1000,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
                 let errMsg = error.localizedDescription
                 clearSessionBuffers()
                 DispatchQueue.main.async { [weak self] in
-                    self?.onError?("云端语音识别失败：\(errMsg)")
+                    self?.onError?("Cloud speech recognition failed: \(errMsg)")
                 }
                 return ("", elapsed)
             }
@@ -1013,7 +1042,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
                 clearSessionBuffers()
                 if !localFallback.isEmpty {
                     DispatchQueue.main.async { [weak self] in
-                        self?.onCloudFailoverNotice?("云端回包超时，已由本机满血 FP32 模型无缝兜底")
+                        self?.onCloudFailoverNotice?("the cloud speech response timed out")
                     }
                     return (localFallback, elapsed)
                 }
@@ -1043,7 +1072,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
                         tailText = Self.runSenseVoice(handle: ptr, samples: remainingSamples, sampleRate: sr, applyWhisperAGC: self.enableWhisperAGC)
                     }
                     let prefix = self.readAndClearFrozenPrefix()
-                    let merged = (prefix + tailText).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let merged = Self.joinTranscriptFragments(prefix, tailText).trimmingCharacters(in: .whitespacesAndNewlines)
                     continuation.resume(returning: merged.isEmpty ? cachedFull : merged)
                 }
             }
@@ -1082,7 +1111,26 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         return p
     }
 
-    private static func runSenseVoice(handle: OpaquePointer, samples: [Float], sampleRate: Int32, applyWhisperAGC: Bool = true) -> String {
+    /// Joins two consecutive ASR fragments. CJK text is concatenated directly (no inter-word spaces);
+    /// Latin text (Parakeet / English) gets exactly one space so segment boundaries never glue sentences together ("done.Next").
+    static func joinTranscriptFragments(_ prefix: String, _ next: String) -> String {
+        guard let last = prefix.last, let first = next.first else { return prefix + next }
+        if last.isWhitespace || first.isWhitespace { return prefix + next }
+        if isCJKOrFullWidth(last) || isCJKOrFullWidth(first) { return prefix + next }
+        // Closing punctuation hugs the previous word ("done" + "." -> "done.").
+        if ",.;:!?)]}%".contains(first) { return prefix + next }
+        return prefix + " " + next
+    }
+
+    static func isCJKOrFullWidth(_ ch: Character) -> Bool {
+        guard let v = ch.unicodeScalars.first?.value else { return false }
+        return (v >= 0x2E80 && v <= 0x9FFF)      // CJK radicals, punctuation, kana, ideographs
+            || (v >= 0xAC00 && v <= 0xD7AF)      // Hangul syllables
+            || (v >= 0xFF00 && v <= 0xFFEF)      // Full-width forms (，。！？)
+    }
+
+    /// Generic decode entry for whichever local model owns `handle` (Parakeet or SenseVoice).
+    static func runSenseVoice(handle: OpaquePointer, samples: [Float], sampleRate: Int32, applyWhisperAGC: Bool = true) -> String {
         guard !samples.isEmpty else { return "" }
         let processed = applyWhisperAGC ? boostQuietSpeechAGC(samples) : samples
         return processed.withUnsafeBufferPointer { ptr in

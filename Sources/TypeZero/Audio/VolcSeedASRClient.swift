@@ -18,8 +18,6 @@ public final class VolcSeedASRClient: @unchecked Sendable {
 
     private var activeAPIKey: String = ""
     private var activeResourceID: String = VolcSeedASRClient.defaultResourceID
-    private var activeEndpointURLString: String = VolcSeedASRClient.endpointURLString
-    private var activeUseBearerAuth: Bool = false
     private var didRetryFreshSocket: Bool = false
     private var replayHandshakeFrames: [Data] = []
     private var sentAudioChunkCount: Int = 0
@@ -71,15 +69,11 @@ public final class VolcSeedASRClient: @unchecked Sendable {
         directSession.dataTask(with: req) { _, _, _ in }.resume()
     }
 
-    private func makeWebSocketTask(apiKey: String, resourceID: String, wsURL: URL, useBearerAuth: Bool = false) -> URLSessionWebSocketTask {
+    private func makeWebSocketTask(apiKey: String, resourceID: String, wsURL: URL) -> URLSessionWebSocketTask {
         var req = URLRequest(url: wsURL)
         req.timeoutInterval = 4.5
-        if useBearerAuth {
-            req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        } else {
-            req.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
-            req.setValue(resourceID, forHTTPHeaderField: "X-Api-Resource-Id")
-        }
+        req.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
+        req.setValue(resourceID, forHTTPHeaderField: "X-Api-Resource-Id")
         req.setValue(UUID().uuidString, forHTTPHeaderField: "X-Api-Connect-Id")
         req.setValue(UUID().uuidString, forHTTPHeaderField: "X-Api-Request-Id")
         let t = directSession.webSocketTask(with: req)
@@ -93,21 +87,16 @@ public final class VolcSeedASRClient: @unchecked Sendable {
         dialogContext: [String] = [],
         enableDDC: Bool = true,
         enableNonstream: Bool = true,
-        resourceID: String = VolcSeedASRClient.defaultResourceID,
-        customEndpointURL: String? = nil,
-        useBearerAuth: Bool = false
+        resourceID: String = VolcSeedASRClient.defaultResourceID
     ) {
         stopAndReset()
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let targetURLString = (customEndpointURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? customEndpointURL!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : Self.endpointURLString
-        guard !cleanKey.isEmpty, let wsURL = URL(string: targetURLString) else {
-            onConnectionFallbackNeeded?(useBearerAuth ? "请先登录 TypeZero 云端体验账号" : "未配置豆包语音 API Key")
+        guard !cleanKey.isEmpty, let wsURL = URL(string: Self.endpointURLString) else {
+            onConnectionFallbackNeeded?("no Doubao speech API key is set")
             return
         }
 
-        let task = makeWebSocketTask(apiKey: cleanKey, resourceID: resourceID, wsURL: wsURL, useBearerAuth: useBearerAuth)
+        let task = makeWebSocketTask(apiKey: cleanKey, resourceID: resourceID, wsURL: wsURL)
 
         stateLock.lock()
         isActive = true
@@ -118,8 +107,6 @@ public final class VolcSeedASRClient: @unchecked Sendable {
         sentAudioChunkCount = 0
         activeAPIKey = cleanKey
         activeResourceID = resourceID
-        activeEndpointURLString = targetURLString
-        activeUseBearerAuth = useBearerAuth
         didRetryFreshSocket = false
         replayHandshakeFrames.removeAll(keepingCapacity: true)
         pendingPCM16Bytes.removeAll(keepingCapacity: true)
@@ -166,7 +153,7 @@ public final class VolcSeedASRClient: @unchecked Sendable {
         }
 
         let initPayload: [String: Any] = [
-            "user": ["uid": "typezero_macos_client"],
+            "user": ["uid": "nevertype_macos_client"],
             "audio": [
                 "format": "pcm",
                 "codec": "raw",
@@ -362,16 +349,15 @@ public final class VolcSeedASRClient: @unchecked Sendable {
            !didRetryFreshSocket,
            receivedServerFrameCount == 0,
            !replayHandshakeFrames.isEmpty,
-           let wsURL = URL(string: activeEndpointURLString) {
+           let wsURL = URL(string: Self.endpointURLString) {
             didRetryFreshSocket = true
             let key = activeAPIKey
             let resID = activeResourceID
-            let useBearer = activeUseBearerAuth
             let framesToReplay = replayHandshakeFrames
             stateLock.unlock()
 
             failedTask.cancel(with: .normalClosure, reason: nil)
-            let replacement = makeWebSocketTask(apiKey: key, resourceID: resID, wsURL: wsURL, useBearerAuth: useBearer)
+            let replacement = makeWebSocketTask(apiKey: key, resourceID: resID, wsURL: wsURL)
             stateLock.lock()
             guard isActive else {
                 stateLock.unlock()
@@ -549,19 +535,14 @@ public final class VolcSeedASRClient: @unchecked Sendable {
         waiting?.resume(returning: finalOut.isEmpty ? nil : finalOut)
     }
 
-    /// Live diagnostic probe: verifies `volc.seedasr.sauc.duration` (or TypeZero Cloud voucher relay) WebSocket auth + RTT in milliseconds.
+    /// Live diagnostic probe: verifies `volc.seedasr.sauc.duration` WebSocket auth + RTT in milliseconds.
     public static func probeHandshakeLatency(
         apiKey: String,
-        resourceID: String = defaultResourceID,
-        customEndpointURL: String? = nil,
-        useBearerAuth: Bool = false
+        resourceID: String = defaultResourceID
     ) async throws -> Int {
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let targetURLString = (customEndpointURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? customEndpointURL!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : endpointURLString
-        guard !cleanKey.isEmpty, let wsURL = URL(string: targetURLString) else {
-            throw NSError(domain: "TypeZero.SeedASR", code: -1, userInfo: [NSLocalizedDescriptionKey: "请先粘贴豆包语音 API Key 或兑换码"])
+        guard !cleanKey.isEmpty, let wsURL = URL(string: endpointURLString) else {
+            throw NSError(domain: "TypeZero.SeedASR", code: -1, userInfo: [NSLocalizedDescriptionKey: "Paste your Doubao speech API key first"])
         }
 
         let cfg = URLSessionConfiguration.ephemeral
@@ -572,12 +553,8 @@ public final class VolcSeedASRClient: @unchecked Sendable {
 
         var req = URLRequest(url: wsURL)
         req.timeoutInterval = 5.0
-        if useBearerAuth {
-            req.setValue("Bearer \(cleanKey)", forHTTPHeaderField: "Authorization")
-        } else {
-            req.setValue(cleanKey, forHTTPHeaderField: "X-Api-Key")
-            req.setValue(resourceID, forHTTPHeaderField: "X-Api-Resource-Id")
-        }
+        req.setValue(cleanKey, forHTTPHeaderField: "X-Api-Key")
+        req.setValue(resourceID, forHTTPHeaderField: "X-Api-Resource-Id")
         req.setValue(UUID().uuidString, forHTTPHeaderField: "X-Api-Connect-Id")
         req.setValue(UUID().uuidString, forHTTPHeaderField: "X-Api-Request-Id")
 
@@ -586,7 +563,7 @@ public final class VolcSeedASRClient: @unchecked Sendable {
         task.resume()
 
         let initPayload: [String: Any] = [
-            "user": ["uid": "typezero_probe"],
+            "user": ["uid": "nevertype_probe"],
             "audio": ["format": "pcm", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1],
             "request": ["model_name": "bigmodel", "enable_itn": true, "enable_punc": true, "result_type": "full"]
         ]
@@ -607,7 +584,7 @@ public final class VolcSeedASRClient: @unchecked Sendable {
             let msgType = raw[1] >> 4
             let comp = raw[2] & 0x0F
             if msgType == 0xF {
-                var detail = "鉴权或资源包错误"
+                var detail = "Authentication or resource package error"
                 if raw.count >= 12 {
                     let errLen = Int(raw.subdata(in: 8..<12).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
                     let body = raw.subdata(in: 12..<min(raw.count, 12 + errLen))

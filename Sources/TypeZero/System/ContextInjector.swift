@@ -3,11 +3,12 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 
+/// Raw values are the English scene labels interpolated into the cleanup prompt's `<scene>` tag (never persisted or shown in the UI).
 public enum AppToneProfile: String {
-    case instantMessaging = "即时聊天"
-    case emailAndFormalDoc = "邮件与正式文档"
-    case aiPromptAndNotes = "AI提问与笔记"
-    case shellTerminal = "命令行终端"
+    case instantMessaging = "chat (instant messaging)"
+    case emailAndFormalDoc = "email or formal document"
+    case aiPromptAndNotes = "AI prompt or notes"
+    case shellTerminal = "command-line terminal"
 }
 
 public struct ActiveScreenContext {
@@ -1704,10 +1705,7 @@ public enum ContextInjector {
     public static func appendInjectionTrace(_ line: String) {
         traceLock.lock()
         defer { traceLock.unlock() }
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return
-        }
-        let dir = appSupport.appendingPathComponent("TypeZero", isDirectory: true)
+        let dir = AppBrand.applicationSupportDirectory()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let logURL = dir.appendingPathComponent("injection-trace.log")
         let entry = "\(Int(Date().timeIntervalSince1970)) \(line)\n"

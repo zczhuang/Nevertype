@@ -150,19 +150,19 @@ public final class OpenAITranscriptionClient: @unchecked Sendable {
     ) async throws -> (text: String, latencyMs: Int) {
         let endpoint = Self.normalizeTranscriptionEndpoint(baseURL)
         guard let url = URL(string: endpoint) else {
-            throw NSError(domain: "TypeZero.OpenAIASR", code: -10, userInfo: [NSLocalizedDescriptionKey: "无效的语音接口地址：\(endpoint)"])
+            throw NSError(domain: "TypeZero.OpenAIASR", code: -10, userInfo: [NSLocalizedDescriptionKey: "Invalid speech endpoint URL: \(endpoint)"])
         }
 
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let isLocalKeyless = PolishEngine.isKeylessLocalEndpoint(baseURL)
         guard !cleanKey.isEmpty || isLocalKeyless else {
-            throw NSError(domain: "TypeZero.OpenAIASR", code: -11, userInfo: [NSLocalizedDescriptionKey: "未配置 OpenAI / Groq 语音 API Key"])
+            throw NSError(domain: "TypeZero.OpenAIASR", code: -11, userInfo: [NSLocalizedDescriptionKey: "No OpenAI / Groq speech API key is set"])
         }
 
         let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveModel = cleanModel.isEmpty ? "gpt-4o-mini-transcribe" : cleanModel
 
-        let boundary = "Boundary-TypeZero-\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+        let boundary = "Boundary-\(AppBrand.name)-\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         var body = Data(capacity: wavData.count + 2048)
 
         func appendField(name: String, value: String) {
@@ -207,7 +207,7 @@ public final class OpenAITranscriptionClient: @unchecked Sendable {
         let latencyMs = Int((DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000)
 
         guard let http = response as? HTTPURLResponse else {
-            throw NSError(domain: "TypeZero.OpenAIASR", code: -12, userInfo: [NSLocalizedDescriptionKey: "未收到有效 HTTP 响应"])
+            throw NSError(domain: "TypeZero.OpenAIASR", code: -12, userInfo: [NSLocalizedDescriptionKey: "No valid HTTP response received"])
         }
 
         guard (200...299).contains(http.statusCode) else {
@@ -215,7 +215,7 @@ public final class OpenAITranscriptionClient: @unchecked Sendable {
             throw NSError(
                 domain: "TypeZero.OpenAIASR",
                 code: http.statusCode,
-                userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)：\(errDetail)"]
+                userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(errDetail)"]
             )
         }
 
