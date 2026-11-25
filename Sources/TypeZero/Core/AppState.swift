@@ -1089,15 +1089,14 @@ public final class AppState: ObservableObject {
         }
 
         // 2. Zero-wait parallel mic start!
-        // Launch ASR streaming immediately (~0.5ms using in-memory lexicon + history + clipboard)
+        // Launch ASR streaming immediately (~0.5ms using in-memory lexicon + history, plus the clipboard only when the speech engine runs on this Mac)
         // so the very first syllable is NEVER clipped while AXUIElement inspects heavy Electron/browser trees.
         syncASREngineConfig()
         let localeID = llmConfig.speechLocale
         let entriesSnapshot = lexiconStore.entries
         let recentSnippets = Array(history.prefix(2).map(\.polishedText))
         let ownSandboxSnapshot = isTypingInsideOwnApp ? String(sandboxText.suffix(140)) : ""
-        let rawClip = (NSPasteboard.general.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let shortClipboardHint = (rawClip.count >= 2 && rawClip.count <= 42 && !rawClip.contains("\n")) ? rawClip : ""
+        let shortClipboardHint = SpeechHintPrivacy.clipboardHintText(from: .general, speechHintsLeaveThisMac: asrEngine.speechHintsLeaveThisMac)
 
         let currentBaseURL = llmConfig.baseURL
         let currentKey = KeychainHelper.loadAPIKey(for: llmConfig.selectedProvider)

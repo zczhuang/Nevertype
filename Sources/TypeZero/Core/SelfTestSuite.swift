@@ -1775,6 +1775,154 @@ public enum SelfTestSuite {
         countdown.start(now: t0.addingTimeInterval(300))
         expect(countdown.remaining == 8 && countdown.isRunning, "Copy pill: a new offer starts a fresh 8 s countdown")
 
+        // 75. Speech hints and the cloud: one decision picks the speech backend, and the same decision says whether the hints (the terms
+        // handed to the recognizer, which can include a clipboard word) would be sent off this Mac. Only a cloud backend whose server is
+        // not on this Mac sends them.
+        do {
+            func leaves(_ provider: ASRProviderOption, volcKey: String = "", openAIKey: String = "", baseURL: String = "https://api.openai.com/v1") -> Bool {
+                StreamingASREngine.speechHintsLeaveThisMac(provider: provider, volcSpeechAPIKey: volcKey, openAIASRAPIKey: openAIKey, openAIASRBaseURL: baseURL)
+            }
+            func choice(_ provider: ASRProviderOption, volcKey: String = "", openAIKey: String = "", baseURL: String = "https://api.openai.com/v1") -> StreamingASREngine.CloudBackendChoice {
+                StreamingASREngine.cloudBackendChoice(provider: provider, volcSpeechAPIKey: volcKey, openAIASRAPIKey: openAIKey, openAIASRBaseURL: baseURL)
+            }
+            expect(
+                leaves(.volcSeedASR, volcKey: "test-key")
+                    && leaves(.openAIWhisper, openAIKey: "test-key", baseURL: "https://api.openai.com/v1")
+                    && leaves(.openAIWhisper, openAIKey: "test-key", baseURL: "https://api.groq.com/openai/v1")
+                    && leaves(.openAIWhisper, openAIKey: "test-key", baseURL: "https://localhost.example.com/v1")
+                    && leaves(.openAIWhisper, openAIKey: "test-key", baseURL: "http://mac-studio.local:8000/v1"),
+                "Speech hints leave this Mac for Volcengine and for an OpenAI-compatible server that is not on it (OpenAI, Groq, localhost.example.com, a .local name)"
+            )
+            expect(
+                leaves(.openAIWhisper, baseURL: "https://localhost.example.com/v1"),
+                "Speech hints leave this Mac for a keyless server named localhost.example.com too: the loose keyless check accepts it, the host check does not"
+            )
+            expect(
+                !leaves(.volcSeedASR) && !leaves(.volcSeedASR, volcKey: "  \n")
+                    && !leaves(.openAIWhisper, baseURL: "http://127.0.0.1:8000/v1")
+                    && !leaves(.openAIWhisper, openAIKey: "test-key", baseURL: "http://localhost:9000/v1")
+                    && !leaves(.openAIWhisper, openAIKey: "test-key", baseURL: "http://[::1]:8000/v1")
+                    && !leaves(.openAIWhisper, baseURL: "https://api.openai.com/v1")
+                    && !leaves(.localSenseVoice, volcKey: "test-key", openAIKey: "test-key"),
+                "Speech hints stay on this Mac for Volcengine without a key, for an OpenAI-compatible server on this Mac, for OpenAI without a key, and for the local engine"
+            )
+            expect(
+                choice(.openAIWhisper, baseURL: "http://127.0.0.1:8000/v1") == .init(seedASR: false, openAI: true)
+                    && choice(.openAIWhisper, openAIKey: "test-key", baseURL: "http://localhost:9000/v1") == .init(seedASR: false, openAI: true)
+                    && choice(.openAIWhisper, openAIKey: "test-key", baseURL: "http://[::1]:8000/v1") == .init(seedASR: false, openAI: true)
+                    && choice(.openAIWhisper, baseURL: "https://api.openai.com/v1") == .init(seedASR: false, openAI: false)
+                    && choice(.volcSeedASR) == .init(seedASR: false, openAI: false)
+                    && choice(.localSenseVoice, volcKey: "test-key", openAIKey: "test-key") == .init(seedASR: false, openAI: false),
+                "Backend choice: a server on this Mac really is the chosen engine there (only its host keeps the hints here), while a missing key or the local engine chooses no cloud backend"
+            )
+            var choiceMatchesEarlierFormulas = true
+            for provider in ASRProviderOption.allCases {
+                for volcKey in ["", "   ", "test-key", " test-key\n"] {
+                    for openAIKey in ["", "   ", "test-key"] {
+                        for baseURL in ["https://api.openai.com/v1", "https://api.groq.com/openai/v1", "http://127.0.0.1:8000/v1", "http://localhost:9000/v1",
+                                        "http://[::1]:8000/v1", "https://localhost.example.com/v1", "http://mac-studio.local:8000/v1", ""] {
+                            // The two formulas `startStreamingInternal` used before the decision was shared:
+                            let cleanSpeechKey = volcKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let cleanOpenAIKey = openAIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let wantCloudSeedASR = (provider == .volcSeedASR) && !cleanSpeechKey.isEmpty
+                            let wantOpenAIASR = (provider == .openAIWhisper) && (!cleanOpenAIKey.isEmpty || PolishEngine.isKeylessLocalEndpoint(baseURL))
+                            let shared = choice(provider, volcKey: volcKey, openAIKey: openAIKey, baseURL: baseURL)
+                            if shared.seedASR != wantCloudSeedASR || shared.openAI != wantOpenAIASR {
+                                choiceMatchesEarlierFormulas = false
+                            }
+                        }
+                    }
+                }
+            }
+            expect(
+                choiceMatchesEarlierFormulas,
+                "Backend choice: the shared decision gives the same answer as the two formulas used before, for every engine, key (empty, blank, set) and base URL tried"
+            )
+            let onThisMac = ["http://127.0.0.1:8000/v1", "http://127.12.0.9/v1", "http://localhost:9000/v1", "HTTP://LocalHost/v1",
+                             "http://[::1]:8000/v1", "http://0.0.0.0:8080/v1", "  http://localhost:11434/v1\n"]
+            let notOnThisMac = ["", "   ", "not a url", "localhost:8000/v1", "https://api.openai.com/v1", "https://localhost.example.com/v1",
+                                "http://127.0.0.1.example.com/v1", "http://localhost@evil.example.com/v1", "http://mac-studio.local:8000/v1",
+                                "http://192.168.1.20:8000/v1", "http://10.0.0.5/v1", "http://128.0.0.1/v1", "http://127.0.0.256/v1", "http://127.0.0/v1"]
+            expect(
+                onThisMac.allSatisfy(StreamingASREngine.isLoopbackEndpoint) && !notOnThisMac.contains(where: StreamingASREngine.isLoopbackEndpoint),
+                "Loopback check: the parsed host must be localhost, ::1, 0.0.0.0 or 127.x.x.x; no host, a non-URL, .local, a LAN address or a name that only contains these does not count"
+            )
+            let engine = StreamingASREngine()
+            engine.asrProvider = .openAIWhisper
+            engine.openAIASRAPIKey = "test-key"
+            engine.openAIASRBaseURL = "https://api.groq.com/openai/v1"
+            let groqLeaves = engine.speechHintsLeaveThisMac
+            engine.openAIASRBaseURL = "http://127.0.0.1:8000/v1"
+            let ownServerStays = !engine.speechHintsLeaveThisMac
+            engine.asrProvider = .volcSeedASR
+            engine.volcSpeechAPIKey = "test-key"
+            let volcengineLeaves = engine.speechHintsLeaveThisMac
+            engine.volcSpeechAPIKey = ""
+            let volcengineWithoutKeyStays = !engine.speechHintsLeaveThisMac
+            expect(
+                groqLeaves && ownServerStays && volcengineLeaves && volcengineWithoutKeyStays,
+                "The engine's own speechHintsLeaveThisMac follows the provider, keys and base URL it holds right now"
+            )
+        }
+
+        // 76. Clipboard hint: used only when the speech engine runs on this Mac, never from contents marked private, and only a short single line
+        do {
+            // A private named pasteboard holding `text`. `marker` is added with empty data to the same item, or to a second item, the way a
+            // password manager marks a copy. NSPasteboardItem refuses a type that is not a valid UTI string ("Pasteboard generator type"
+            // has spaces), so that legacy marker is declared on the pasteboard itself, as an older app would. The real clipboard is never
+            // read or written.
+            func hint(for text: String, marker: String? = nil, markerOnSecondItem: Bool = false, speechHintsLeaveThisMac: Bool = false) -> String {
+                let pasteboard = NSPasteboard(name: NSPasteboard.Name("io.github.typezero.selftest.\(UUID().uuidString)"))
+                defer { pasteboard.releaseGlobally() }
+                pasteboard.clearContents()
+                let first = NSPasteboardItem()
+                first.setString(text, forType: .string)
+                var items = [first]
+                var legacyMarker: NSPasteboard.PasteboardType? = nil
+                if let marker {
+                    let type = NSPasteboard.PasteboardType(marker)
+                    if marker.contains(" ") {
+                        legacyMarker = type
+                    } else if markerOnSecondItem {
+                        let second = NSPasteboardItem()
+                        second.setData(Data(), forType: type)
+                        items.append(second)
+                    } else {
+                        first.setData(Data(), forType: type)
+                    }
+                }
+                pasteboard.writeObjects(items)
+                if let legacyMarker { pasteboard.setData(Data(), forType: legacyMarker) }
+                return SpeechHintPrivacy.clipboardHintText(from: pasteboard, speechHintsLeaveThisMac: speechHintsLeaveThisMac)
+            }
+            let markers = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType",
+                           "com.agilebits.onepassword", "de.petermaurer.TransientPasteboardType", "com.typeit4me.clipping",
+                           "Pasteboard generator type", "net.antelle.keeweb"]
+            expect(
+                hint(for: "Kubernetes") == "Kubernetes" && hint(for: "Kubernetes", speechHintsLeaveThisMac: true) == "",
+                "Clipboard hint: a short word is used when the speech engine runs on this Mac, and nothing is used when the hints would leave it"
+            )
+            expect(
+                SpeechHintPrivacy.privateClipboardTypes.isSuperset(of: markers),
+                "Clipboard hint: the private markers include the nspasteboard.org types and the legacy markers of password managers and clipboard tools"
+            )
+            expect(
+                hint(for: "hunter2") == "hunter2" && markers.allSatisfy { hint(for: "hunter2", marker: $0) == "" },
+                "Clipboard hint: text copied with any private marker is not used, while the same text without a marker is"
+            )
+            expect(
+                hint(for: "hunter2", marker: "org.nspasteboard.ConcealedType", markerOnSecondItem: true) == ""
+                    && hint(for: "hunter2", marker: "com.agilebits.onepassword", markerOnSecondItem: true) == "",
+                "Clipboard hint: a private marker on a second pasteboard item counts too"
+            )
+            let fortyTwo = String(repeating: "x", count: 42)
+            expect(
+                hint(for: "first line\nsecond line") == "" && hint(for: "a") == "" && hint(for: fortyTwo + "x") == ""
+                    && hint(for: "ab") == "ab" && hint(for: fortyTwo) == fortyTwo && hint(for: "  Kubernetes \n") == "Kubernetes",
+                "Clipboard hint: only one line of 2 to 42 characters is used, after trimming; several lines, 1 character and 43 characters give nothing"
+            )
+        }
+
         print("==> Summary: \(passed) passed, \(failed) failed.")
         return failed == 0 ? 0 : 1
     }

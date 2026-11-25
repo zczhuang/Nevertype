@@ -159,6 +159,88 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         request.contextualStrings = contextualStrings
     }
 
+    // MARK: Which backend a dictation uses, and whether its speech hints leave this Mac
+
+    /// The cloud speech backends one dictation would use. When neither is set, the local sherpa-onnx model runs, or macOS
+    /// on-device recognition when no model is installed; both stay on this Mac.
+    struct CloudBackendChoice: Equatable {
+        /// Volcengine Seed ASR: it is the chosen engine and a key is set.
+        var seedASR: Bool
+        /// OpenAI-compatible transcription: it is the chosen engine and a key is set, or the base URL names a keyless local server.
+        var openAI: Bool
+    }
+
+    /// The one decision about the cloud backends, made from the settings alone. `startStreamingInternal` starts the backend this
+    /// picks, and `speechHintsLeaveThisMac` asks the same question, so the privacy rules always assume the backend that really runs.
+    static func cloudBackendChoice(
+        provider: ASRProviderOption,
+        volcSpeechAPIKey: String,
+        openAIASRAPIKey: String,
+        openAIASRBaseURL: String
+    ) -> CloudBackendChoice {
+        let cleanSpeechKey = volcSpeechAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanOpenAIKey = openAIASRAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CloudBackendChoice(
+            seedASR: (provider == .volcSeedASR) && !cleanSpeechKey.isEmpty,
+            openAI: (provider == .openAIWhisper) && (!cleanOpenAIKey.isEmpty || PolishEngine.isKeylessLocalEndpoint(openAIASRBaseURL))
+        )
+    }
+
+    /// True when the speech hints of a dictation (the terms handed to the recognizer, which can include a word from the clipboard)
+    /// would be sent off this Mac: Volcengine is used, or the OpenAI-compatible engine is used and its server is not on this Mac.
+    /// The local models and macOS on-device recognition keep the hints here. A server on this Mac is recognized by `isLoopbackEndpoint`, not by the loose
+    /// `PolishEngine.isKeylessLocalEndpoint`, which also accepts a name such as `localhost.example.com`.
+    static func speechHintsLeaveThisMac(
+        provider: ASRProviderOption,
+        volcSpeechAPIKey: String,
+        openAIASRAPIKey: String,
+        openAIASRBaseURL: String
+    ) -> Bool {
+        let backend = cloudBackendChoice(
+            provider: provider,
+            volcSpeechAPIKey: volcSpeechAPIKey,
+            openAIASRAPIKey: openAIASRAPIKey,
+            openAIASRBaseURL: openAIASRBaseURL
+        )
+        if backend.seedASR { return true }
+        return backend.openAI && !isLoopbackEndpoint(openAIASRBaseURL)
+    }
+
+    /// `speechHintsLeaveThisMac(provider:volcSpeechAPIKey:openAIASRAPIKey:openAIASRBaseURL:)` for the settings this engine holds now.
+    public var speechHintsLeaveThisMac: Bool {
+        Self.speechHintsLeaveThisMac(
+            provider: asrProvider,
+            volcSpeechAPIKey: volcSpeechAPIKey,
+            openAIASRAPIKey: openAIASRAPIKey,
+            openAIASRBaseURL: openAIASRBaseURL
+        )
+    }
+
+    /// True only when `baseURL` points at this Mac. The URL is parsed and its host, lowercased, must be `localhost`, `::1` (written
+    /// `[::1]` in a URL), `0.0.0.0` or an IPv4 address in 127.0.0.0/8. Everything else counts as another machine: no host, a string
+    /// that is not a URL, a `.local` name, a LAN address, and a name that only contains "localhost" (`localhost.example.com`).
+    static func isLoopbackEndpoint(_ baseURL: String) -> Bool {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, var host = URLComponents(string: trimmed)?.host?.lowercased() else { return false }
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        if host == "localhost" || host == "::1" || host == "0.0.0.0" {
+            return true
+        }
+        // IPv4 only when it is exactly four decimal numbers from 0 to 255; the first one must be 127.
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        var octets: [Int] = []
+        for part in parts {
+            guard (1...3).contains(part.count),
+                  part.allSatisfy({ ("0"..."9").contains($0) }),
+                  let value = Int(part), value <= 255 else { return false }
+            octets.append(value)
+        }
+        return octets[0] == 127
+    }
+
     public static var isMicrophoneAuthorized: Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     }
@@ -475,8 +557,15 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
 
         let cleanSpeechKey = volcSpeechAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanOpenAIKey = openAIASRAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        let wantCloudSeedASR = (asrProvider == .volcSeedASR) && !cleanSpeechKey.isEmpty
-        let wantOpenAIASR = (asrProvider == .openAIWhisper) && (!cleanOpenAIKey.isEmpty || PolishEngine.isKeylessLocalEndpoint(openAIASRBaseURL))
+        // The same decision the clipboard privacy rule asks about (`speechHintsLeaveThisMac`), so the two cannot disagree.
+        let cloudBackend = Self.cloudBackendChoice(
+            provider: asrProvider,
+            volcSpeechAPIKey: volcSpeechAPIKey,
+            openAIASRAPIKey: openAIASRAPIKey,
+            openAIASRBaseURL: openAIASRBaseURL
+        )
+        let wantCloudSeedASR = cloudBackend.seedASR
+        let wantOpenAIASR = cloudBackend.openAI
         let hasLocalSenseVoice = isUsingSenseVoice && (senseVoiceHandle != nil)
 
         if wantCloudSeedASR || wantOpenAIASR || hasLocalSenseVoice {
