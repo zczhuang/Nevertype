@@ -5,13 +5,15 @@ import SQLite3
 // MARK: - Typeless history import
 //
 // One-way, read-only sync of the dictations recorded by the Typeless app into Nevertype's History. It is opt-in
-// (`LLMConfig.enableTypelessImport`, off by default): while the setting is off, nothing in here opens the database.
+// (`LLMConfig.enableTypelessImport`, off by default): while the setting is off, nothing in here opens the database or
+// the recordings.
 //
 //   typeless.db (SQLite, opened read-only)  ->  eligible rows  ->  DictationRecord  ->  AppState.history + history.json
 //
 // Which rows are importable, how a row maps onto a record and how the result is merged are plain functions in this
 // file, so `TypelessImportSelfTests` can check them against a throw-away SQLite fixture. Nothing in here ever writes
-// to Typeless's files: the database is opened with SQLITE_OPEN_READONLY, and the fallback works on a private copy.
+// to Typeless's files: the database is opened with SQLITE_OPEN_READONLY, and the fallback works on a private copy. The same
+// goes for the recordings (`TypelessRecordings`): each audio file is opened read-only, measured and closed, and none is copied.
 
 // MARK: Rows and candidates
 
@@ -23,6 +25,8 @@ struct TypelessRow: Equatable, Sendable {
     var refinedText: String
     var duration: Double
     var createdAt: String
+    /// `audio_local_path`: where Typeless says it saved this dictation's audio. Empty when the column is NULL.
+    var audioLocalPath: String = ""
 }
 
 /// A row that passed every filter, already mapped to a Nevertype record.
@@ -52,6 +56,13 @@ enum TypelessPaths {
     /// asks the file system (like `ls`); it never opens or reads the file.
     static var databaseExists: Bool {
         FileManager.default.fileExists(atPath: databaseURL.path)
+    }
+
+    /// `~/Library/Application Support/Typeless/Recordings`: Typeless keeps one `<id>.ogg` here per dictation.
+    static var recordingsURL: URL {
+        applicationSupport
+            .appendingPathComponent("Typeless", isDirectory: true)
+            .appendingPathComponent("Recordings", isDirectory: true)
     }
 
     /// `~/Library/Application Support/Nevertype/typeless-imported-ids.json`, next to `history.json`.
@@ -229,6 +240,20 @@ enum TypelessMerger {
         }
         return TypelessMergeResult(history: added > 0 ? kept : existing, importedIDs: knownIDs, addedCount: added)
     }
+
+    /// Gives the records that have no speaking time yet the one measured for them (`measured` is keyed by record id). A record
+    /// that already has one is never changed. Returns how many records were updated.
+    static func fillSpeakingTimes(in history: inout [DictationRecord], from measured: [UUID: Double]) -> Int {
+        guard !measured.isEmpty else { return 0 }
+        var updated = 0
+        for index in history.indices where history[index].speakingSeconds == nil {
+            if let seconds = measured[history[index].id] {
+                history[index].speakingSeconds = seconds
+                updated += 1
+            }
+        }
+        return updated
+    }
 }
 
 // MARK: Imported-ids store
@@ -254,6 +279,76 @@ struct TypelessImportedIDStore {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(Payload(version: 1, ids: ids.sorted()))
         try data.write(to: url, options: .atomic)
+    }
+}
+
+// MARK: Recordings (speaking time)
+
+/// The audio Typeless keeps for each dictation, and the speaking time measured from it. Recordings are only ever read: a file is
+/// opened read-only, decoded in chunks and closed, and nothing is copied, moved or changed.
+enum TypelessRecordings {
+    /// The audio file of a dictation: `storedPath` (its `audio_local_path`) when that is an absolute path that resolves to
+    /// something inside `directory`, otherwise `<directory>/<id>.ogg`. nil when neither does. Whether the file exists is not
+    /// checked here.
+    ///
+    /// A path is standardized (`.` and `..` removed) and its symbolic links are resolved before it is compared with the
+    /// resolved `directory`, and the resolved path is what comes back, so a link or a `..` cannot lead out of the folder.
+    static func audioURL(id: String, storedPath: String, in directory: URL) -> URL? {
+        var candidates: [URL] = []
+        let stored = storedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stored.hasPrefix("/") { candidates.append(URL(fileURLWithPath: stored)) }
+        candidates.append(directory.appendingPathComponent("\(id).ogg"))
+        for candidate in candidates {
+            if let inside = resolved(candidate, insideDirectory: directory) { return inside }
+        }
+        return nil
+    }
+
+    /// `url` standardized and with its symbolic links resolved, if that is a path below `directory` (never `directory` itself).
+    private static func resolved(_ url: URL, insideDirectory directory: URL) -> URL? {
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath().path
+        let target = url.standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        guard target.path.hasPrefix(prefix), target.path.count > prefix.count else { return nil }
+        return target
+    }
+
+    /// Measures the speaking time of the dictations that need one, from their recordings in `directory`:
+    ///  - every eligible row not yet imported (`importedIDs`) that can still fit in a history of `historyCap` records, which
+    ///    are the `historyCap` newest of them, because the sync will add those;
+    ///  - every eligible row whose record is already in the history without a speaking time (`needing`, a set of record ids).
+    ///
+    /// Returns record id -> speaking seconds. A dictation whose file is missing, outside `directory` or cannot be decoded is
+    /// left out: it stays unknown and is tried again by the next sync. Reads files, so call it off the main thread.
+    ///
+    /// `shouldContinue` is asked before each recording is looked at. When it says no, the loop stops and what was measured so
+    /// far is returned; no further file is touched. `measureFile` measures one file (the self-tests replace it).
+    static func measureSpeakingTimes(
+        rows: [TypelessRow],
+        importedIDs: Set<String>,
+        needing: Set<UUID>,
+        historyCap: Int,
+        in directory: URL,
+        shouldContinue: () -> Bool = { true },
+        measureFile: (URL) -> SpeakingTimeMeter.Measurement? = { SpeakingTimeMeter.measure(fileAt: $0) }
+    ) -> [UUID: Double] {
+        let candidates = TypelessMapper.scan(rows).candidates
+        let fresh = candidates.filter { !importedIDs.contains($0.typelessID) }.prefix(max(historyCap, 0))
+        let backfill = candidates.filter { needing.contains($0.record.id) }
+        guard !fresh.isEmpty || !backfill.isEmpty else { return [:] }
+
+        let rowsByID = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var measured: [UUID: Double] = [:]
+        var tried = Set<UUID>()
+        for candidate in fresh + backfill {
+            guard shouldContinue() else { break }
+            guard tried.insert(candidate.record.id).inserted,
+                  let row = rowsByID[candidate.typelessID],
+                  let url = audioURL(id: row.id, storedPath: row.audioLocalPath, in: directory),
+                  let measurement = measureFile(url) else { continue }
+            measured[candidate.record.id] = measurement.speakingSeconds
+        }
+        return measured
     }
 }
 
@@ -287,7 +382,16 @@ enum TypelessReadOutcome: Sendable {
 }
 
 enum TypelessDatabaseReader {
-    static let selectSQL = "SELECT id, status, mode, refined_text, duration, created_at FROM history_v2"
+    /// The `history_v2` columns every version of Typeless has.
+    private static let baseColumns = "id, status, mode, refined_text, duration, created_at"
+    /// Where Typeless says it saved a dictation's audio. Not every version of Typeless has this column.
+    private static let audioPathColumn = "audio_local_path"
+
+    /// The query for the rows. The audio path column is left out when the table does not have it (an older Typeless, or a later
+    /// one that dropped it): the import then works as before, with every recording path empty.
+    static func selectSQL(withAudioPath: Bool) -> String {
+        "SELECT \(baseColumns)\(withAudioPath ? ", \(audioPathColumn)" : "") FROM history_v2"
+    }
 
     /// Reads every `history_v2` row. Returns `.missing` when there is no `typeless.db` (nothing to do).
     ///
@@ -386,8 +490,9 @@ enum TypelessDatabaseReader {
         defer { sqlite3_close_v2(db) }
         sqlite3_busy_timeout(db, busyTimeoutMs)
 
+        let hasAudioPath = try historyColumnNames(db).contains(audioPathColumn)
         var prepared: OpaquePointer?
-        let prepareCode = sqlite3_prepare_v2(db, selectSQL, -1, &prepared, nil)
+        let prepareCode = sqlite3_prepare_v2(db, selectSQL(withAudioPath: hasAudioPath), -1, &prepared, nil)
         guard prepareCode == SQLITE_OK, let statement = prepared else {
             throw TypelessReadError(code: prepareCode, message: String(cString: sqlite3_errmsg(db)))
         }
@@ -403,10 +508,35 @@ enum TypelessDatabaseReader {
                     mode: text(statement, 2),
                     refinedText: text(statement, 3),
                     duration: number(statement, 4),
-                    createdAt: text(statement, 5)
+                    createdAt: text(statement, 5),
+                    audioLocalPath: hasAudioPath ? text(statement, 6) : ""
                 ))
             } else if step == SQLITE_DONE {
                 return rows
+            } else {
+                throw TypelessReadError(code: step, message: String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+
+    /// The (lowercased) column names of `history_v2`, from `PRAGMA table_info`; empty when there is no such table (the query
+    /// then fails and names it). A failure of the PRAGMA itself is an ordinary read error, so a busy or hot-journal database is
+    /// retried and copied as before, never mistaken for a table that lacks a column.
+    private static func historyColumnNames(_ db: OpaquePointer) throws -> Set<String> {
+        var prepared: OpaquePointer?
+        let prepareCode = sqlite3_prepare_v2(db, "PRAGMA table_info(history_v2)", -1, &prepared, nil)
+        guard prepareCode == SQLITE_OK, let statement = prepared else {
+            throw TypelessReadError(code: prepareCode, message: String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var names = Set<String>()
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_ROW {
+                names.insert(text(statement, 1).lowercased())
+            } else if step == SQLITE_DONE {
+                return names
             } else {
                 throw TypelessReadError(code: step, message: String(cString: sqlite3_errmsg(db)))
             }
@@ -472,17 +602,39 @@ enum TypelessSyncResult: Equatable, Sendable {
     }
 }
 
+/// Set on the main actor and read on a background thread, to tell a pass that is measuring recordings to stop. The thread
+/// reads this, never the import switch itself, which belongs to the main actor.
+private final class TypelessStopSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requested = false
+
+    var isRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return requested
+    }
+
+    func set(_ value: Bool) {
+        lock.lock()
+        requested = value
+        lock.unlock()
+    }
+}
+
 /// Runs syncs one at a time: the database is read off the main thread, the result is merged into the history on the
 /// main actor, then `history.json` and the imported-ids file are written.
 ///
-/// Every sync, automatic or manual, first asks the host whether the user switched the import on. While it is off the
-/// database is not opened, and nothing is read or written.
+/// Every sync, automatic or manual, first asks the host whether the user switched the import on. While it is off neither
+/// the database nor the recordings are opened, and nothing is read or written. A pass that is already measuring recordings
+/// when the switch is turned off (see `setImportEnabled`) opens no further one.
 @MainActor
 final class TypelessSyncCoordinator {
     static let shared = TypelessSyncCoordinator()
 
     struct Configuration {
         var databaseURL: URL = TypelessPaths.databaseURL
+        /// The folder the dictations' audio files must be in to be measured.
+        var recordingsURL: URL = TypelessPaths.recordingsURL
         var store = TypelessImportedIDStore(url: TypelessPaths.importedIDsURL)
         var readOptions = TypelessReadOptions()
         var historyCap = TypelessMerger.historyCap
@@ -490,11 +642,15 @@ final class TypelessSyncCoordinator {
         var read: @Sendable (URL, TypelessReadOptions) throws -> TypelessReadOutcome = { url, options in
             try TypelessDatabaseReader.read(from: url, options: options)
         }
+        /// Measures one recording. Replaced by the self-tests; always called off the main thread.
+        var measureFile: @Sendable (URL) -> SpeakingTimeMeter.Measurement? = { SpeakingTimeMeter.measure(fileAt: $0) }
     }
 
     var configuration: Configuration
     private var running: Task<TypelessSyncResult, Never>?
     private var launchSyncStarted = false
+    /// Set when the switch is turned off, cleared when a pass starts.
+    private let stopSignal = TypelessStopSignal()
 
     init(configuration: Configuration = Configuration()) {
         self.configuration = configuration
@@ -540,12 +696,15 @@ final class TypelessSyncCoordinator {
     }
 
     /// Flips the import switch. Turning it on runs one import right away, as a manual sync, so its outcome shows in the
-    /// status banner; the returned task is that import. Turning it off only clears the switch, so nothing opens the
-    /// database again.
+    /// status banner; the returned task is that import. Turning it off clears the switch, so nothing opens the database
+    /// again, and tells a pass that is measuring recordings to stop before it opens the next one.
     @discardableResult
     func setImportEnabled(_ enabled: Bool, on host: any TypelessHistoryHost) -> Task<TypelessSyncResult?, Never>? {
         host.typelessImportEnabled = enabled
-        guard enabled else { return nil }
+        guard enabled else {
+            stopSignal.set(true)
+            return nil
+        }
         return Task { @MainActor [self] in await sync(into: host, manual: true) }
     }
 
@@ -554,36 +713,71 @@ final class TypelessSyncCoordinator {
         if manual || host.statusBanner.isEmpty { host.statusBanner = text }
     }
 
+    /// Reads the database and measures the missing speaking times, both off the main thread, then merges on the main actor.
     private func runPass(into host: any TypelessHistoryHost) async -> TypelessSyncResult {
+        // The switch may have been turned off since this pass was requested. Looked at before the stop signal is cleared below,
+        // so that a request made in that gap is not lost: nothing is opened at all then.
+        guard host.typelessImportEnabled else { return .disabled }
         let config = configuration
-        let outcome: Result<TypelessReadOutcome, Error> = await withCheckedContinuation { continuation in
+        // A pass starts with no stop request. Turning the switch off while it runs sets one (`setImportEnabled`), and the
+        // measuring below, which is off the main thread, looks at that instead of at the switch.
+        let stop = stopSignal
+        stop.set(false)
+        // Records already in the history that have no speaking time yet: their recordings are measured along with the new ones.
+        let needing = Set(host.history.filter { $0.speakingSeconds == nil }.map(\.id))
+        let outcome: Result<(TypelessReadOutcome, [UUID: Double]), Error> = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                continuation.resume(returning: Result { try config.read(config.databaseURL, config.readOptions) })
+                continuation.resume(returning: Result {
+                    let outcome = try config.read(config.databaseURL, config.readOptions)
+                    guard case .rows(let rows, _) = outcome else { return (outcome, [:]) }
+                    let measured = TypelessRecordings.measureSpeakingTimes(
+                        rows: rows,
+                        importedIDs: config.store.load(),
+                        needing: needing,
+                        historyCap: config.historyCap,
+                        in: config.recordingsURL,
+                        shouldContinue: { !stop.isRequested },
+                        measureFile: config.measureFile
+                    )
+                    return (outcome, measured)
+                })
             }
         }
         // The switch may have been turned off while the database was being read: honor the latest choice.
         guard host.typelessImportEnabled else { return .disabled }
         switch outcome {
         case .failure(let error): return .failed(error.localizedDescription)
-        case .success(.missing): return .databaseMissing
-        case .success(.rows(let rows, _)): return apply(rows: rows, to: host)
+        case .success((.missing, _)): return .databaseMissing
+        case .success((.rows(let rows, _), let measured)): return apply(rows: rows, speakingSeconds: measured, to: host)
         }
     }
 
-    /// Merges `rows` into `host.history`. History is written before the imported-ids file: if the app stops in
+    /// Merges `rows` into `host.history` and sets the speaking times in `speakingSeconds` (record id -> seconds) on the new
+    /// records and on records that have none yet. History is written before the imported-ids file: if the app stops in
     /// between, the next sync finds the records already in history and only records their ids, rather than losing them.
-    func apply(rows: [TypelessRow], to host: any TypelessHistoryHost) -> TypelessSyncResult {
+    ///
+    /// A pass that only filled in speaking times still writes the history, but reports `.upToDate`: nothing was imported, so
+    /// it gets no "Synced N dictations" banner.
+    func apply(rows: [TypelessRow], speakingSeconds: [UUID: Double] = [:], to host: any TypelessHistoryHost) -> TypelessSyncResult {
         let store = configuration.store
         let known = store.load()
         let scan = TypelessMapper.scan(rows)
+        let candidates = scan.candidates.map { candidate -> TypelessCandidate in
+            guard let seconds = speakingSeconds[candidate.record.id] else { return candidate }
+            var record = candidate.record
+            record.speakingSeconds = seconds
+            return TypelessCandidate(typelessID: candidate.typelessID, record: record)
+        }
         let merged = TypelessMerger.merge(
             existing: host.history,
-            candidates: scan.candidates,
+            candidates: candidates,
             importedIDs: known,
             cap: configuration.historyCap
         )
-        if merged.addedCount > 0 {
-            host.history = merged.history
+        var history = merged.addedCount > 0 ? merged.history : host.history
+        let filled = TypelessMerger.fillSpeakingTimes(in: &history, from: speakingSeconds)
+        if merged.addedCount > 0 || filled > 0 {
+            host.history = history
             host.persistHistory()
         }
         if merged.importedIDs != known {

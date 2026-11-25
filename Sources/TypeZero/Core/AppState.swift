@@ -1167,7 +1167,7 @@ public final class AppState: ObservableObject {
         if asrEngine.activeSessionUsesOpenAIASR {
             phase = .polishing(rawText: "Transcribing in the cloud…")
         }
-        let (rawText, duration) = await asrEngine.finishStreaming()
+        let (rawText, duration, speakingSeconds) = await asrEngine.finishStreaming()
         guard !rawText.isEmpty else {
             if isTypingInsideOwnApp {
                 sandboxText = sandboxBaseBeforeSession
@@ -1331,7 +1331,8 @@ public final class AppState: ObservableObject {
             polishLatencyMs: polishMs,
             targetAppName: isTypingInsideOwnApp ? "\(AppBrand.name) Sandbox" : activeContext.appName,
             mode: activeMode,
-            matchedTerms: recalled.prefix(5).map(\.term)
+            matchedTerms: recalled.prefix(5).map(\.term),
+            speakingSeconds: speakingSeconds
         )
         history.insert(record, at: 0)
         if history.count > 1000 {

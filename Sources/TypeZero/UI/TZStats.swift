@@ -7,7 +7,8 @@ import Foundation
 enum TZStats {
     /// Typing speed used for the "Time saved" estimate.
     static let typingWPM: Double = 40
-    /// Records shorter than this are ignored when computing the dictation speed.
+    /// Records with less time than this are ignored when computing the dictation speed: less speaking time, or, while no record
+    /// has a speaking time, less recording time.
     static let minSecondsForSpeed: Double = 0.5
 
     // MARK: Words
@@ -78,7 +79,10 @@ enum TZStats {
         var speedWords: Int = 0
         var speedMinutes: Double = 0
 
-        /// Words per minute of dictation (records under 0.5 s excluded). 0 when there is nothing to measure.
+        /// Words per minute of speaking: the words of the records that have a speaking time (at least 0.5 s of it) over those
+        /// speaking minutes, so pauses do not slow it down. While no record has a speaking time (a history from before it was
+        /// measured) it is words per minute of recording time over the records of at least 0.5 s, as it always was. 0 when
+        /// there is nothing to measure.
         var wpm: Int {
             guard speedMinutes > 0.0001 else { return 0 }
             return Int((Double(speedWords) / speedMinutes).rounded())
@@ -90,15 +94,20 @@ enum TZStats {
         }
     }
 
+    /// `words`, `dictationMinutes` (and so `savedMinutes`) always use the recording time. The speed (`speedWords` over
+    /// `speedMinutes`) uses the speaking time as soon as one record has it, and then only the records that have it; it uses the
+    /// recording time only while none does, so the two kinds of time never mix in one figure.
     static func totals(_ history: [DictationRecord]) -> Totals {
         var t = Totals()
+        let measuredSpeakingTime = history.contains { $0.speakingSeconds != nil }
         for record in history {
             let words = wordCount(record.polishedText)
             t.words += words
             t.dictationMinutes += record.durationSeconds / 60.0
-            if record.durationSeconds >= minSecondsForSpeed {
+            let speedSeconds = measuredSpeakingTime ? record.speakingSeconds : record.durationSeconds
+            if let speedSeconds, speedSeconds >= minSecondsForSpeed {
                 t.speedWords += words
-                t.speedMinutes += record.durationSeconds / 60.0
+                t.speedMinutes += speedSeconds / 60.0
             }
         }
         return t

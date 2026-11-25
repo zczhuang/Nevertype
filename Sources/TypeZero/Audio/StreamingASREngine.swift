@@ -26,6 +26,9 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
     /// Completed & locked earlier sentences (never re-decoded again -> zero drift, zero memory bloat!)
     private var frozenTranscriptPrefix: String = ""
     private var currentSampleRate: Int32 = 48_000
+    /// How long the user spoke in the current session, pauses left out. Reset when a capture session starts; fed with every
+    /// captured buffer (not with the pre-roll, which is audio from before the session began) under `sampleLock`.
+    private var speakingMeter = SpeakingTimeMeter(sampleRate: 48_000)
     private var lastDecodedSampleCount: Int = 0
     private var isDecodingChunk: Bool = false
 
@@ -488,6 +491,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             self.sampleLock.unlock()
             return
         }
+        self.speakingMeter.append(UnsafeBufferPointer(start: channel0, count: count))
         if !currentlyOpenAICloud {
             self.activeSegmentSamples.append(contentsOf: UnsafeBufferPointer(start: channel0, count: count))
         }
@@ -530,6 +534,15 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
                 self.seedASRClient.appendPCM16Samples(pcm16)
             }
         }
+    }
+
+    /// Adds a captured buffer (channel 0) to the speaking-time meter. For the Apple fallback tap, whose audio does not go through
+    /// `handleIncomingAudioBuffer`.
+    private func appendToSpeakingMeter(_ buffer: AVAudioPCMBuffer) {
+        guard let channel0 = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
+        sampleLock.lock()
+        speakingMeter.append(UnsafeBufferPointer(start: channel0, count: Int(buffer.frameLength)))
+        sampleLock.unlock()
     }
 
     private func startStreamingInternal(
@@ -625,6 +638,7 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
             }
             frozenTranscriptPrefix = ""
             currentSampleRate = hwRate
+            speakingMeter = SpeakingTimeMeter(sampleRate: Double(currentSampleRate))
             lastDecodedSampleCount = 0
             lastDecodedVoiceSampleMark = 0
             totalVoiceSamplesInSegment = 0
@@ -680,10 +694,16 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         let request = SFSpeechAudioBufferRecognitionRequest()
         Self.configureAppleFallbackRequest(request, contextualStrings: contextualStrings)
         self.fallbackRequest = request
+        sampleLock.lock()
+        speakingMeter = SpeakingTimeMeter(sampleRate: recordingFormat.sampleRate)
+        sampleLock.unlock()
 
         inputNode.installTap(onBus: 0, bufferSize: 512, format: recordingFormat) { [weak self] buffer, _ in
             guard let self else { return }
             self.fallbackRequest?.append(buffer)
+            if self.fallbackRequest != nil {
+                self.appendToSpeakingMeter(buffer)
+            }
             let (level, _) = Self.calculateRMSMetrics(buffer: buffer)
             AudioLevelBus.shared.push(level)
         }
@@ -1013,7 +1033,23 @@ public final class StreamingASREngine: NSObject, @unchecked Sendable {
         return (wasVolc, wasOpenAI, hadAnySpeech, backupSamples, backupSR, hw, loc)
     }
 
-    public func finishStreaming() async -> (transcript: String, duration: Double) {
+    /// A copy of the speaking-time meter as it is now. Cheap: the level array is shared until the audio tap appends to it again.
+    private func takeSpeakingMeterSnapshot() -> SpeakingTimeMeter {
+        sampleLock.lock()
+        defer { sampleLock.unlock() }
+        return speakingMeter
+    }
+
+    /// Ends the session and returns what was heard, how long the session ran, and how much of that the user spent speaking
+    /// (pauses left out, see `SpeakingTimeMeter`; never more than `duration`).
+    public func finishStreaming() async -> (transcript: String, duration: Double, speakingSeconds: Double) {
+        // Copied before anything below can change the session, at the same moment `duration` is taken; the rule runs on the copy.
+        let meter = takeSpeakingMeterSnapshot()
+        let (transcript, duration) = await finishStreamingTranscript()
+        return (transcript, duration, min(max(0, meter.result.speakingSeconds), max(0, duration)))
+    }
+
+    private func finishStreamingTranscript() async -> (transcript: String, duration: Double) {
         let elapsed = Date().timeIntervalSince(sessionStartTime)
         liveTimer?.cancel()
         liveTimer = nil

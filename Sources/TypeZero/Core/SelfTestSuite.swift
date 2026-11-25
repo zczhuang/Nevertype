@@ -1923,6 +1923,274 @@ public enum SelfTestSuite {
             )
         }
 
+        // 77. Speaking time (`SpeakingTimeMeter`): the calibrated pause rule on synthetic audio. A 440 Hz tone is speech and faint, fixed
+        // noise is the quiet room. Everything is in memory or in a throw-away temp folder.
+        do {
+            typealias Audio = SpeakingTestAudio
+            func measured(_ samples: [Float], rate: Double = Audio.sampleRate) -> SpeakingTimeMeter.Measurement {
+                var meter = SpeakingTimeMeter(sampleRate: rate)
+                meter.append(samples)
+                return meter.result
+            }
+            func levels(_ db: Float, _ count: Int) -> [Float] { [Float](repeating: db, count: count) }
+            func rule(_ frameLevels: [Float], total: Double) -> Double {
+                SpeakingTimeMeter.speakingSeconds(levels: frameLevels, frameSeconds: 0.01, totalSeconds: total)
+            }
+            let oneFrame = 1 / SpeakingTimeMeter.framesPerSecond
+
+            expect(
+                SpeakingTimeMeter.framesPerSecond == 100 && SpeakingTimeMeter.noiseFloorPercentile == 0.10
+                    && SpeakingTimeMeter.loudLevelPercentile == 0.95 && SpeakingTimeMeter.speechMarginDB == 13
+                    && SpeakingTimeMeter.loudMarginDB == 10 && SpeakingTimeMeter.minimumPauseSeconds == 0.3
+                    && SpeakingTimeMeter.minimumMeasurableSeconds == 1.0 && SpeakingTimeMeter.minimumRMS == 1e-5
+                    && SpeakingTimeMeter.digitalSilenceLevel == -100
+                    && SpeakingTimeMeter.isDigitalSilence(-100) && !SpeakingTimeMeter.isDigitalSilence(-99.9),
+                "Speaking time: the calibrated rule is 10 ms frames, a 10th-percentile noise floor + 13 dB, a 95th-percentile loud level - 10 dB, 0.3 s minimum pauses, a 1 s minimum length, and digital silence at -100 dBFS"
+            )
+            let frameLengths = [48_000.0, 44_100.0, 16_000.0, 22_050.0, 0, .nan].map { SpeakingTimeMeter(sampleRate: $0).frameLength }
+            expect(frameLengths == [480, 441, 160, 221, 1, 1], "Speaking time: a frame is 10 ms of samples (rounded, never fewer than one), and a bad sample rate cannot trap")
+
+            // 2 s of speech, 1 s of quiet, 2 s of speech: the pause comes out.
+            let spoken = Audio.tone(2) + Audio.hiss(1) + Audio.tone(2)
+            let base = measured(spoken)
+            expect(
+                abs(base.recordingSeconds - 5.0) < 1e-9 && abs(base.speakingSeconds - 4.0) <= 2 * oneFrame,
+                "Speaking time: 2 s of tone, 1 s of faint noise and 2 s of tone measure about 4 s of speaking in 5 s of recording"
+            )
+
+            // A quiet run shorter than 0.3 s is part of speaking; one of exactly 0.3 s is a pause.
+            let shortGaps = measured(Audio.tone(0.6) + Audio.hiss(0.2) + Audio.tone(0.6) + Audio.hiss(0.2, seed: 2) + Audio.tone(0.6))
+            let exactPause = measured(Audio.tone(0.6) + Audio.hiss(0.3) + Audio.tone(0.6))
+            expect(
+                abs(shortGaps.recordingSeconds - 2.2) < 1e-9 && abs(shortGaps.speakingSeconds - shortGaps.recordingSeconds) < 1e-9,
+                "Speaking time: two 0.2 s gaps are not pauses, so nothing is taken out of the recording"
+            )
+            expect(abs(exactPause.speakingSeconds - 1.2) <= oneFrame, "Speaking time: a quiet run of exactly 0.3 s is a pause (1.5 s of recording -> 1.2 s of speaking)")
+
+            // A recording shorter than 1 s counts in full; at 1 s the rule applies.
+            let belowOneSecond = measured(Audio.tone(0.3) + Audio.hiss(0.5))
+            let silentBelowOneSecond = measured(Audio.hiss(0.9))
+            let exactlyOneSecond = measured(Audio.tone(0.2) + Audio.hiss(0.8))
+            let justOverOneSecond = measured(Audio.tone(0.3) + Audio.hiss(0.8))
+            expect(
+                abs(belowOneSecond.speakingSeconds - 0.8) < 1e-9 && abs(silentBelowOneSecond.speakingSeconds - 0.9) < 1e-9
+                    && abs(exactlyOneSecond.speakingSeconds - 0.2) <= oneFrame && abs(justOverOneSecond.speakingSeconds - 0.3) <= oneFrame,
+                "Speaking time: a recording under 1 s counts in full, however quiet; from 1 s on its 0.8 s pause is taken out"
+            )
+
+            // The rule only looks at levels relative to the recording's own levels.
+            let quieter = measured(spoken.map { $0 * 0.1 })
+            let louder = measured(spoken.map { $0 * 4 })
+            expect(
+                abs(quieter.speakingSeconds - base.speakingSeconds) < 1e-9 && abs(louder.speakingSeconds - base.speakingSeconds) < 1e-9,
+                "Speaking time: scaling the whole signal by 0.1, or by 4, gives the same speaking time"
+            )
+
+            // However the samples are split into appends, the answer is the same.
+            var oneShot = SpeakingTimeMeter(sampleRate: Audio.sampleRate)
+            oneShot.append(spoken)
+            var chunked = SpeakingTimeMeter(sampleRate: Audio.sampleRate)
+            var chunkRandom: UInt64 = 12_345
+            var chunkStart = 0
+            var viaBuffer = false
+            while chunkStart < spoken.count {
+                chunkRandom = chunkRandom &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                let size = min(1 + Int((chunkRandom >> 33) % 5_000), spoken.count - chunkStart)
+                let slice = Array(spoken[chunkStart..<(chunkStart + size)])
+                if viaBuffer { slice.withUnsafeBufferPointer { chunked.append($0) } } else { chunked.append(slice) }
+                viaBuffer.toggle()
+                chunkStart += size
+            }
+            var oneByOne = SpeakingTimeMeter(sampleRate: Audio.sampleRate)
+            for sample in spoken.prefix(5_000) { oneByOne.append([sample]) }
+            var firstChunk = SpeakingTimeMeter(sampleRate: Audio.sampleRate)
+            firstChunk.append(Array(spoken.prefix(5_000)))
+            var untouched = SpeakingTimeMeter(sampleRate: Audio.sampleRate)
+            untouched.append([Float]())
+            expect(
+                chunked.frameLevels == oneShot.frameLevels && chunked.sampleCount == spoken.count && chunked.result == oneShot.result
+                    && oneByOne.frameLevels == firstChunk.frameLevels && oneByOne.result == firstChunk.result
+                    && untouched.sampleCount == 0 && untouched.result == (0, 0),
+                "Speaking time: random chunk sizes (as arrays and as buffers), one sample at a time and empty appends all give exactly the one-append result"
+            )
+
+            // The unfinished frame at the end counts as a frame (a full frame of quiet time when it is quiet).
+            let withTail = Audio.tone(1) + Audio.hiss(1) + Audio.hiss(samples: 50, seed: 3)
+            var tailMeter = SpeakingTimeMeter(sampleRate: Audio.sampleRate)
+            tailMeter.append(withTail)
+            let tailSpeaking = Double(withTail.count) / Audio.sampleRate - 101 * oneFrame
+            expect(
+                tailMeter.frameLevels.count == 200 && tailMeter.sampleCount == 96_050 && abs(tailMeter.result.speakingSeconds - tailSpeaking) < 1e-9,
+                "Speaking time: a final partial frame counts as a frame (100 quiet frames and a partial one make a 1.01 s pause)"
+            )
+
+            // Speech with almost no pauses: the level only swings up and down, 2 to 4 times a second like syllables, and nothing is silent.
+            // The 10th-percentile level of such a recording is part of the speech itself, so a threshold a fixed 12 dB above it lies above
+            // most of the frames. That older rule kept 0%, 31% and 100% of these three as speaking; the last, widest and fastest swing
+            // never leaves a quiet stretch of 0.3 s, so it passes under either rule and only guards against a threshold set too high.
+            let narrowSwing = measured(Audio.swing(seconds: 5, hertz: 3, swingDB: 5))
+            let mediumSwing = measured(Audio.swing(seconds: 5, hertz: 2, swingDB: 8))
+            let wideSwing = measured(Audio.swing(seconds: 5, hertz: 4, swingDB: 10))
+            expect(
+                narrowSwing.speakingSeconds >= 0.9 * narrowSwing.recordingSeconds,
+                "Speaking time: 5 s of tone with no silence whose level swings 10 dB from trough to peak, 3 times a second, keeps at least 90% as speaking"
+            )
+            expect(
+                mediumSwing.speakingSeconds >= 0.9 * mediumSwing.recordingSeconds,
+                "Speaking time: ... and so does one that swings 16 dB from trough to peak, 2 times a second"
+            )
+            expect(
+                wideSwing.speakingSeconds >= 0.9 * wideSwing.recordingSeconds,
+                "Speaking time: ... and one that swings 20 dB from trough to peak, 4 times a second"
+            )
+
+            // Digital zeros (the start of an Opus file, a microphone that is not warm yet) are not the room: they take no part in the
+            // noise floor or the loud level, but they are quiet when pauses are looked for.
+            let speechPauseSpeech = Audio.tone(1.2) + Audio.hiss(1) + Audio.tone(1.2)
+            let withoutZeros = measured(speechPauseSpeech)
+            let withZeros = measured(Audio.zeros(0.6) + speechPauseSpeech)
+            let scaledWithZeros = measured((Audio.zeros(0.6) + speechPauseSpeech).map { $0 * 0.1 })
+            let shortZeros = measured(Audio.zeros(0.2) + speechPauseSpeech)
+            expect(
+                abs(withoutZeros.speakingSeconds - 2.4) <= oneFrame && abs(withZeros.recordingSeconds - 4.0) < 1e-9
+                    && abs(withZeros.speakingSeconds - withoutZeros.speakingSeconds) <= oneFrame
+                    && abs(scaledWithZeros.speakingSeconds - withZeros.speakingSeconds) < 1e-9,
+                "Speaking time: 15% leading digital zeros change nothing but the zeros themselves: the pause is found as before (2.4 s of speaking with or without them), at any gain"
+            )
+            expect(
+                abs(shortZeros.speakingSeconds - (withoutZeros.speakingSeconds + 0.2)) <= oneFrame,
+                "Speaking time: digital zeros are quiet like any other quiet frames, so 0.2 s of them before the speech is no pause"
+            )
+            expect(
+                measured(Audio.zeros(1.0)).speakingSeconds == 0 && measured(Audio.zeros(2.0)).speakingSeconds == 0
+                    && abs(measured(Audio.zeros(0.9)).speakingSeconds - 0.9) < 1e-9,
+                "Speaking time: a recording of digital silence has no speaking time from 1 s on, and counts in full under 1 s"
+            )
+
+            // The rule on frame levels: nearest-rank percentiles of the frames that are not digital silence, the threshold the lower of
+            // floor + 13 dB and loud level - 10 dB (a frame has to be strictly above it), pauses of 30 frames or more.
+            expect(
+                abs(rule(levels(-70, 40) + levels(-20, 60), total: 1.0) - 0.6) < 1e-9
+                    && abs(rule(levels(-20, 35) + levels(-70, 29) + levels(-20, 36), total: 1.0) - 1.0) < 1e-9
+                    && abs(rule(levels(-20, 35) + levels(-70, 30) + levels(-20, 35), total: 1.0) - 0.7) < 1e-9
+                    && abs(rule(levels(-20, 70) + levels(-70, 30), total: 1.0) - 0.7) < 1e-9,
+                "Speaking time: a quiet run of 29 frames stays, 30 frames are a pause, at the start, in the middle or at the end"
+            )
+            expect(
+                abs(rule(levels(-70, 40) + levels(-57, 20) + levels(-20, 40), total: 1.0) - 0.4) < 1e-9
+                    && abs(rule(levels(-70, 40) + levels(-56, 20) + levels(-20, 40), total: 1.0) - 0.6) < 1e-9,
+                "Speaking time: a frame exactly 13 dB above the noise floor is still quiet, one just above that is speech"
+            )
+            expect(
+                abs(rule(levels(-32, 35) + levels(-22, 65), total: 1.0) - 0.65) < 1e-9
+                    && abs(rule(levels(-31, 35) + levels(-22, 65), total: 1.0) - 1.0) < 1e-9,
+                "Speaking time: the threshold is capped 10 dB below the loud level: a frame 10 dB below it is quiet, one 9 dB below it is speech, however close the noise floor is"
+            )
+            expect(
+                abs(rule(levels(-70, 10) + levels(-50, 30) + levels(-20, 60), total: 1.0) - 0.6) < 1e-9
+                    && abs(rule(levels(-40, 30) + levels(-35, 67) + levels(0, 3), total: 1.0) - 1.0) < 1e-9,
+                "Speaking time: the noise floor is the level at nearest rank round(0.1 * (n - 1)) and the loud level the one at round(0.95 * (n - 1)), so a few peaks do not set the loud level"
+            )
+            expect(
+                abs(rule(levels(-100, 40) + levels(-20, 60), total: 1.0) - 0.6) < 1e-9
+                    && abs(rule(levels(-100, 20) + levels(-20, 80), total: 1.0) - 1.0) < 1e-9
+                    && abs(rule(levels(-100, 15) + levels(-70, 20) + levels(-20, 65), total: 1.0) - 0.65) < 1e-9
+                    && abs(rule(levels(-100, 40) + levels(-99.5, 60), total: 1.0) - 0.6) < 1e-9,
+                "Speaking time: digital silence (-100 dBFS) is left out of the percentiles, yet is quiet in the pause search whatever the threshold is"
+            )
+            expect(
+                rule([], total: 5) == 5 && rule(levels(-70, 50), total: 0.5) == 0.5
+                    && rule(levels(-100, 100), total: 1.0) == 0 && rule(levels(-100, 250), total: 2.5) == 0,
+                "Speaking time: no frames, or under 1 s, count in full; a recording of digital silence has no speaking time from 1 s on"
+            )
+            expect(
+                rule(levels(-70, 100), total: 1.0) == 1.0 && abs(measured(Audio.hiss(2)).speakingSeconds - 2.0) < 1e-9,
+                "Speaking time: a recording at one steady level has nothing 10 dB below its loud level, so all of it counts as speaking"
+            )
+
+            // Files: the same answer as the samples in memory, read-only, unreadable files are nil, and the developer report.
+            let audioFolder = FileManager.default.temporaryDirectory.appendingPathComponent("typezero-speaking-selftest-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: audioFolder, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: audioFolder) }
+            let wavURL = audioFolder.appendingPathComponent("clip.wav")
+            let garbageURL = audioFolder.appendingPathComponent("garbage.ogg")
+            let emptyURL = audioFolder.appendingPathComponent("empty.ogg")
+            try? Data(String(repeating: "not audio ", count: 500).utf8).write(to: garbageURL)
+            try? Data().write(to: emptyURL)
+            let wroteWAV = Audio.writeWAV(spoken, to: wavURL)
+            let attributesBefore = try? FileManager.default.attributesOfItem(atPath: wavURL.path)
+            let fromFile = SpeakingTimeMeter.measure(fileAt: wavURL)
+            let attributesAfter = try? FileManager.default.attributesOfItem(atPath: wavURL.path)
+            expect(
+                wroteWAV && abs((fromFile?.recordingSeconds ?? -1) - base.recordingSeconds) < 1e-9
+                    && abs((fromFile?.speakingSeconds ?? -1) - base.speakingSeconds) < 1e-9,
+                "Speaking time: measuring a WAV file gives the same answer as the same samples in memory"
+            )
+            expect(
+                (attributesBefore?[.size] as? NSNumber) == (attributesAfter?[.size] as? NSNumber)
+                    && (attributesBefore?[.modificationDate] as? Date) == (attributesAfter?[.modificationDate] as? Date),
+                "Speaking time: measuring a file leaves it as it was"
+            )
+            expect(
+                SpeakingTimeMeter.measure(fileAt: garbageURL) == nil && SpeakingTimeMeter.measure(fileAt: emptyURL) == nil
+                    && SpeakingTimeMeter.measure(fileAt: audioFolder.appendingPathComponent("missing.ogg")) == nil,
+                "Speaking time: a file that is missing, empty or not audio is unknown (nil), not zero"
+            )
+            // A compressed file's length is only an estimate: one that is cut short opens, claims its full length, and then fails to
+            // read. What could be read is measured (it used to be thrown away).
+            let aacURL = audioFolder.appendingPathComponent("clip.caf")
+            let cutURL = audioFolder.appendingPathComponent("clip-cut.caf")
+            let wroteAAC = Audio.writeAAC(spoken, to: aacURL)
+            let aacData = (try? Data(contentsOf: aacURL)) ?? Data()
+            try? aacData.prefix(aacData.count * 9 / 10).write(to: cutURL)
+            let wholeAAC = SpeakingTimeMeter.measure(fileAt: aacURL)
+            let cutAAC = SpeakingTimeMeter.measure(fileAt: cutURL)
+            expect(
+                wroteAAC && !aacData.isEmpty && abs((wholeAAC?.recordingSeconds ?? -1) - 5.0) < 0.2
+                    && abs((wholeAAC?.speakingSeconds ?? -1) - 4.0) < 0.2,
+                "Speaking time: a compressed (AAC) file measures about the same as the audio it was made from"
+            )
+            expect(
+                cutAAC != nil && (cutAAC?.recordingSeconds ?? 0) > 0.5 && (cutAAC?.recordingSeconds ?? 9) <= (wholeAAC?.recordingSeconds ?? 0) + 1e-9
+                    && (cutAAC?.speakingSeconds ?? 9) <= (cutAAC?.recordingSeconds ?? 0) + 1e-9
+                    && SpeakingTimeMeter.measure(fileAt: audioFolder.appendingPathComponent("not-there.caf")) == nil,
+                "Speaking time: a compressed file that is cut short gives the measurement of what could be read, not nil; only a file with nothing readable is nil"
+            )
+            expect(
+                SpeakingTimeMeter.report(forFiles: [wavURL.path, garbageURL.path])
+                    == ["recording=5.00\tspeaking=4.00\tclip.wav", "error\tgarbage.ogg", "total recording=5.00 speaking=4.00 files=1"]
+                    && SpeakingTimeMeter.report(forFiles: []) == ["total recording=0.00 speaking=0.00 files=0"],
+                "Speaking time: --speaking-time prints one line per file (tab separated, file name only, error for an unreadable file) and a total line"
+            )
+
+            // History: a history.json from before the field existed still decodes, and an unmeasured record's JSON is unchanged.
+            let beforeJSON = #"[{"id":"7B3C2D1E-0000-4000-8000-000000000002","timestamp":0,"rawTranscript":"a","polishedText":"b","durationSeconds":4,"polishLatencyMs":5,"targetAppName":"Notes","mode":"口述成稿","matchedTerms":[]}]"#
+            let decodedBefore = try? JSONDecoder().decode([DictationRecord].self, from: Data(beforeJSON.utf8))
+            let unmeasuredRecord = DictationRecord(rawTranscript: "a", polishedText: "b", durationSeconds: 4, polishLatencyMs: 5, targetAppName: "Notes")
+            let measuredRecord = DictationRecord(rawTranscript: "a", polishedText: "b", durationSeconds: 4, polishLatencyMs: 5, targetAppName: "Notes", speakingSeconds: 3.25)
+            let unmeasuredText = (try? JSONEncoder().encode([unmeasuredRecord])).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let measuredData = try? JSONEncoder().encode([unmeasuredRecord, measuredRecord])
+            let roundTrip = measuredData.flatMap { try? JSONDecoder().decode([DictationRecord].self, from: $0) }
+            expect(
+                decodedBefore?.count == 1 && decodedBefore?.first?.speakingSeconds == nil && decodedBefore?.first?.durationSeconds == 4
+                    && !unmeasuredText.isEmpty && !unmeasuredText.contains("speakingSeconds"),
+                "Speaking time: a history.json without the key decodes to nil, and a record that was never measured is written without the key"
+            )
+            expect(
+                roundTrip?.count == 2 && roundTrip?[0].speakingSeconds == nil && roundTrip?[1].speakingSeconds == 3.25
+                    && roundTrip?[1].id == measuredRecord.id,
+                "Speaking time: a measured value survives the history.json encode/decode round trip"
+            )
+            let nonFinite = DictationRecord(rawTranscript: "a", polishedText: "b", durationSeconds: 4, polishLatencyMs: 5, targetAppName: "Notes", speakingSeconds: .infinity)
+            let notANumber = DictationRecord(rawTranscript: "a", polishedText: "b", durationSeconds: 4, polishLatencyMs: 5, targetAppName: "Notes", speakingSeconds: .nan)
+            let negative = DictationRecord(rawTranscript: "a", polishedText: "b", durationSeconds: 4, polishLatencyMs: 5, targetAppName: "Notes", speakingSeconds: -2)
+            expect(
+                nonFinite.speakingSeconds == nil && notANumber.speakingSeconds == nil && negative.speakingSeconds == 0
+                    && (try? JSONEncoder().encode([nonFinite, notANumber, negative])) != nil,
+                "Speaking time: a value that cannot be written to JSON is dropped (it would stop history.json from saving), and a negative one becomes 0"
+            )
+        }
+
         print("==> Summary: \(passed) passed, \(failed) failed.")
         return failed == 0 ? 0 : 1
     }
@@ -2156,5 +2424,80 @@ public enum SelfTestSuite {
             RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.015))
         }
         return 0
+    }
+}
+
+/// Synthetic audio for the speaking-time self-tests (`SelfTestSuite` and `TypelessImportSelfTests`): a 440 Hz tone stands for
+/// speech and faint noise, the same on every run, for the quiet room. The levels are far enough apart (about 50 dB) that frames
+/// never land near the +13 dB threshold, so the expected speaking times are exact to a frame.
+enum SpeakingTestAudio {
+    static let sampleRate = 48_000.0
+
+    /// `seconds` of a 440 Hz sine with the given peak `amplitude` (about -13.5 dBFS rms at 0.3).
+    static func tone(_ seconds: Double, amplitude: Float = 0.3) -> [Float] {
+        let count = Int((seconds * sampleRate).rounded())
+        return (0..<count).map { Float(Double(amplitude) * sin(2 * Double.pi * 440 * Double($0) / sampleRate)) }
+    }
+
+    /// `samples` samples of faint noise, uniform in +-`amplitude` (about -64 dBFS rms at 0.001). The same `seed` gives the same noise.
+    static func hiss(samples count: Int, amplitude: Float = 0.001, seed: UInt64 = 1) -> [Float] {
+        var state = seed
+        return (0..<count).map { _ in
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return amplitude * (Float((state >> 40) & 0xFFFF) / 32_767.5 - 1)
+        }
+    }
+
+    static func hiss(_ seconds: Double, amplitude: Float = 0.001, seed: UInt64 = 1) -> [Float] {
+        hiss(samples: Int((seconds * sampleRate).rounded()), amplitude: amplitude, seed: seed)
+    }
+
+    /// `seconds` of digital silence: every sample exactly zero.
+    static func zeros(_ seconds: Double) -> [Float] {
+        [Float](repeating: 0, count: Int((seconds * sampleRate).rounded()))
+    }
+
+    /// `seconds` of a 440 Hz tone, with no silence in it, whose level swings sinusoidally by +-`swingDB` around its mean (-20 dBFS
+    /// peak) `hertz` times a second: a stand-in for speech without pauses. The swing is in dB, so it is `2 * swingDB` from trough to peak.
+    static func swing(seconds: Double, hertz: Double, swingDB: Double) -> [Float] {
+        let count = Int((seconds * sampleRate).rounded())
+        return (0..<count).map { index in
+            let time = Double(index) / sampleRate
+            let amplitude = 0.1 * pow(10, swingDB * sin(2 * Double.pi * hertz * time) / 20)
+            return Float(amplitude * sin(2 * Double.pi * 440 * time))
+        }
+    }
+
+    /// Writes `samples` as a mono 32-bit float WAV file. Every sample is stored exactly, so measuring the file gives the same
+    /// answer as measuring the samples. False when the file could not be written.
+    static func writeWAV(_ samples: [Float], to url: URL) -> Bool {
+        write(samples, to: url, settings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ])
+    }
+
+    /// Writes `samples` as mono AAC in a CAF file (a compressed format, so its length is an estimate). False when it could not be written.
+    static func writeAAC(_ samples: [Float], to url: URL) -> Bool {
+        write(samples, to: url, settings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 64_000
+        ])
+    }
+
+    private static func write(_ samples: [Float], to url: URL, settings: [String: Any]) -> Bool {
+        guard let file = try? AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false),
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(samples.count)),
+              let channel = buffer.floatChannelData?[0] else { return false }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        for (index, sample) in samples.enumerated() { channel[index] = sample }
+        return (try? file.write(from: buffer)) != nil
     }
 }

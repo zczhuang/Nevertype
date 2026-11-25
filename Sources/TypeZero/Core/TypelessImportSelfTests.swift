@@ -56,6 +56,9 @@ enum TypelessImportSelfTests {
         syncPassTests(t, sandbox: sandbox)
         asyncSyncTests(t, sandbox: sandbox)
         optInTests(t, sandbox: sandbox)
+        recordingPathTests(t, sandbox: sandbox)
+        speakingTimeTests(t, sandbox: sandbox)
+        missingAudioColumnTests(t, sandbox: sandbox)
         dryRunTests(t, sandbox: sandbox)
 
         print("==> Typeless import summary: \(t.passed) passed, \(t.failed) failed.")
@@ -71,11 +74,12 @@ enum TypelessImportSelfTests {
         var text: String?
         var duration: Double? = 3
         var createdAt = "2026-11-24T12:00:00.000Z"
+        var audioPath: String?
     }
 
     /// 11 rows: 4 importable, 7 that every filter must reject.
     private static let canonicalRows: [FixtureRow] = [
-        FixtureRow(id: "9F1B7C52-3D2A-4E7B-8C11-0A5D6E7F8091", text: "Hello from Typeless.", duration: 4.5, createdAt: "2026-11-24T21:21:24.992Z"),
+        FixtureRow(id: "9F1B7C52-3D2A-4E7B-8C11-0A5D6E7F8091", text: "Hello from Typeless.", duration: 4.5, createdAt: "2026-11-24T21:21:24.992Z", audioPath: "/Users/someone/Library/Application Support/Typeless/Recordings/9F1B7C52-3D2A-4E7B-8C11-0A5D6E7F8091.ogg"),
         FixtureRow(id: "row-two", text: "Second dictation", duration: 12, createdAt: "2026-11-24T20:00:00.000Z"),
         FixtureRow(id: "row-three", text: "  padded with spaces  \n", duration: 1.25, createdAt: "2026-11-23T08:30:15.500Z"),
         FixtureRow(id: "noms-1", text: "no fractional seconds", duration: 3, createdAt: "2026-11-22T10:00:00Z"),
@@ -91,7 +95,7 @@ enum TypelessImportSelfTests {
     /// Fixture rows as `TypelessDatabaseReader` returns them.
     private static func readerRows(_ rows: [FixtureRow]) -> [TypelessRow] {
         rows.map {
-            TypelessRow(id: $0.id, status: $0.status, mode: $0.mode, refinedText: $0.text ?? "", duration: $0.duration ?? 0, createdAt: $0.createdAt)
+            TypelessRow(id: $0.id, status: $0.status, mode: $0.mode, refinedText: $0.text ?? "", duration: $0.duration ?? 0, createdAt: $0.createdAt, audioLocalPath: $0.audioPath ?? "")
         }
     }
 
@@ -138,17 +142,22 @@ enum TypelessImportSelfTests {
     CREATE TABLE history (id text PRIMARY KEY NOT NULL, text text, created_at text);
     """
 
+    /// The same layout without the `audio_local_path` column, as an older Typeless (or a later one that dropped it) would have it.
+    private static let schemaWithoutAudioPath = schema.replacingOccurrences(of: "    audio_local_path text,\n", with: "")
+
     /// A throw-away copy of Typeless's database layout. Keep the object alive to keep its connection open.
     private final class FixtureDB {
         let url: URL
         private var handle: OpaquePointer?
+        private let hasAudioColumn: Bool
 
-        init?(url: URL, wal: Bool, rows: [FixtureRow], legacyRows: Int = 0, createHistoryV2: Bool = true) {
+        init?(url: URL, wal: Bool, rows: [FixtureRow], legacyRows: Int = 0, createHistoryV2: Bool = true, audioColumn: Bool = true) {
             self.url = url
+            self.hasAudioColumn = audioColumn
             guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else { return nil }
             if wal, !exec("PRAGMA journal_mode=WAL;") { return nil }
             if createHistoryV2 {
-                guard exec(TypelessImportSelfTests.schema) else { return nil }
+                guard exec(audioColumn ? TypelessImportSelfTests.schema : TypelessImportSelfTests.schemaWithoutAudioPath) else { return nil }
             } else {
                 guard exec("CREATE TABLE unrelated (x integer);") else { return nil }
             }
@@ -168,8 +177,8 @@ enum TypelessImportSelfTests {
         @discardableResult
         func insert(_ row: FixtureRow) -> Bool {
             let sql = """
-            INSERT INTO history_v2 (id, status, mode, refined_text, duration, created_at, updated_at, debug_info, mode_meta, audio_context, sync_status)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, '{}', 'encrypted-blob', 'synced')
+            INSERT INTO history_v2 (id, status, mode, refined_text, duration, created_at, updated_at, debug_info, mode_meta, audio_context, sync_status\(hasAudioColumn ? ", audio_local_path" : ""))
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, '{}', 'encrypted-blob', 'synced'\(hasAudioColumn ? ", ?8" : ""))
             """
             var prepared: OpaquePointer?
             guard sqlite3_prepare_v2(handle, sql, -1, &prepared, nil) == SQLITE_OK, let statement = prepared else { return false }
@@ -182,6 +191,9 @@ enum TypelessImportSelfTests {
             if let duration = row.duration { sqlite3_bind_double(statement, 5, duration) } else { sqlite3_bind_null(statement, 5) }
             sqlite3_bind_text(statement, 6, row.createdAt, -1, transient)
             sqlite3_bind_text(statement, 7, String(repeating: "debug-info ", count: 40), -1, transient)
+            if hasAudioColumn {
+                if let audioPath = row.audioPath { sqlite3_bind_text(statement, 8, audioPath, -1, transient) } else { sqlite3_bind_null(statement, 8) }
+            }
             return sqlite3_step(statement) == SQLITE_DONE
         }
 
@@ -316,6 +328,8 @@ enum TypelessImportSelfTests {
         t.expect(ids.hasSuffix("/Library/Application Support/Nevertype/typeless-imported-ids.json"), "imported-ids file sits in Nevertype's Application Support folder")
         t.expect(TypelessPaths.importedIDsURL.deletingLastPathComponent().lastPathComponent == AppBrand.name && ids != database, "imported-ids file is next to history.json, not inside Typeless's folder")
         t.expect(database.hasPrefix(home.path) && ids.hasPrefix(home.path), "guard rail: while the suite runs, the default paths point into the sandbox, not the real home folder")
+        let recordings = TypelessPaths.recordingsURL.path
+        t.expect(recordings.hasSuffix("/Library/Application Support/Typeless/Recordings") && recordings.hasPrefix(home.path), "Typeless's recordings folder is Application Support/Typeless/Recordings (inside the sandbox home while the suite runs)")
 
         // `databaseExists` (what decides whether Settings offers the switch) is a plain existence check, inside the sandbox only.
         if database.hasPrefix(home.path) {
@@ -431,6 +445,7 @@ enum TypelessImportSelfTests {
                     t.expect(hello?.refinedText == "Hello from Typeless." && hello?.duration == 4.5 && hello?.createdAt == "2026-11-24T21:21:24.992Z" && hello?.status == "completed" && hello?.mode == "voice_transcript", "reader: columns come back intact")
                     let null = rows.first { $0.id == "null-1" }
                     t.expect(null?.refinedText == "" && null?.duration == 0, "reader: NULL text and duration come back as empty and 0")
+                    t.expect(hello?.audioLocalPath == "/Users/someone/Library/Application Support/Typeless/Recordings/9F1B7C52-3D2A-4E7B-8C11-0A5D6E7F8091.ogg" && null?.audioLocalPath == "", "reader: audio_local_path comes back as stored, and NULL as empty")
                 } else {
                     t.expect(false, "reader: reads a rollback-journal database")
                 }
@@ -954,8 +969,8 @@ enum TypelessImportSelfTests {
 
     // MARK: - Opt-in
 
-    /// The import is opt-in: off by default, silent while off (the database is never opened), and one import right away when
-    /// the user turns it on.
+    /// The import is opt-in: off by default, silent while off (neither the database nor the recordings are opened), and one
+    /// import right away when the user turns it on.
     private static func optInTests(_ t: Checker, sandbox: URL) {
         // The setting: off by default, for old configs, and for unreadable values; on only when saved as on.
         let oldConfig = try? JSONDecoder().decode(LLMConfig.self, from: Data(#"{"baseURL":"http://127.0.0.1:11434/v1","modelName":"gemma4:12b-mlx"}"#.utf8))
@@ -1106,6 +1121,395 @@ enum TypelessImportSelfTests {
                 "opt-in: if the switch is turned off while a sync is reading, nothing is merged or written"
             )
         }
+
+        // The recordings follow the same switch. With it off, a clip that the database points to is not measured; with it on, the
+        // same setup measures it. (A speaking time is what shows it: reading a file leaves nothing else behind to look at.)
+        let clipFolder = makeDirectory(dir, "Recordings")
+        let clipURL = clipFolder.appendingPathComponent("hello.wav")
+        var clipRows = canonicalRows
+        clipRows[0].audioPath = clipURL.path
+        let wroteClip = SpeakingTestAudio.writeWAV(SpeakingTestAudio.tone(2) + SpeakingTestAudio.hiss(1) + SpeakingTestAudio.tone(2), to: clipURL)
+        guard wroteClip, let clipFixture = FixtureDB(url: dir.appendingPathComponent("typeless-with-clip.db"), wal: false, rows: clipRows) else {
+            t.expect(false, "fixture: a database and a recording for the opt-in recordings test could be created")
+            return
+        }
+        clipFixture.close()
+        var clipConfig = makeConfig("clip-ids.json")
+        clipConfig.databaseURL = clipFixture.url
+        clipConfig.recordingsURL = clipFolder
+        let withClip = clipConfig
+        struct ClipLog {
+            var readsWhileOff = -1
+            var historyWhileOff = -1
+            var speakingWhenOn: Double?
+        }
+        let readsBeforeClip = reads.value
+        let clipLog: ClipLog = runOnMain(ClipLog()) {
+            let host = FakeHost(history: [], importEnabled: false)
+            let coordinator = TypelessSyncCoordinator(configuration: withClip)
+            var log = ClipLog()
+            await coordinator.syncOnLaunch(into: host)
+            await coordinator.sync(into: host, manual: false)
+            await coordinator.sync(into: host, manual: true)
+            log.readsWhileOff = reads.value - readsBeforeClip
+            log.historyWhileOff = host.history.count
+            host.typelessImportEnabled = true
+            await coordinator.sync(into: host, manual: true)
+            log.speakingWhenOn = host.history.first { $0.polishedText == "Hello from Typeless." }?.speakingSeconds
+            return log
+        }
+        t.expect(
+            clipLog.readsWhileOff == 0 && clipLog.historyWhileOff == 0 && abs((clipLog.speakingWhenOn ?? -1) - 4.0) <= 0.02,
+            "opt-in: with the switch off a recording is not measured; with it on, the same setup measures it (4.0 s of speaking in a 5.0 s clip)"
+        )
+
+        // A pass that is already measuring recordings stops when the switch is turned off. Four clips, one for each importable row,
+        // and a `measureFile` that holds the pass after the first one, make the moment deterministic.
+        let stopDir = makeDirectory(dir, "stop-measuring")
+        let stopFolder = makeDirectory(stopDir, "Recordings")
+        var stopRows = canonicalRows
+        var wroteStopClips = true
+        for index in 0..<4 {
+            let clip = stopFolder.appendingPathComponent("clip-\(index).wav")
+            wroteStopClips = SpeakingTestAudio.writeWAV(SpeakingTestAudio.tone(1.5) + SpeakingTestAudio.hiss(0.5), to: clip) && wroteStopClips
+            stopRows[index].audioPath = clip.path
+        }
+        guard wroteStopClips, let stopFixture = FixtureDB(url: stopDir.appendingPathComponent("typeless.db"), wal: false, rows: stopRows) else {
+            t.expect(false, "fixture: a database and four recordings for the stop tests could be created")
+            return
+        }
+        stopFixture.close()
+        let measuredFiles = Counter()
+        let firstMeasured = DispatchSemaphore(value: 0)
+        let switchTurnedOff = DispatchSemaphore(value: 0)
+        var holdingConfig = makeConfig("stop-ids.json")
+        holdingConfig.databaseURL = stopFixture.url
+        holdingConfig.recordingsURL = stopFolder
+        holdingConfig.measureFile = { url in
+            measuredFiles.increment()
+            let measurement = SpeakingTimeMeter.measure(fileAt: url)
+            if measuredFiles.value == 1 {
+                firstMeasured.signal()
+                switchTurnedOff.wait()
+            }
+            return measurement
+        }
+        let holding = holdingConfig
+        let stopHost = Box<FakeHost?>(nil)
+        let stopCoordinator = Box<TypelessSyncCoordinator?>(nil)
+        let stopResult = Box<TypelessSyncResult??>(nil)
+        MainActor.assumeIsolated {
+            stopHost.value = FakeHost(history: [], importEnabled: true)
+            stopCoordinator.value = TypelessSyncCoordinator(configuration: holding)
+        }
+        Task { @MainActor in
+            stopResult.value = .some(await stopCoordinator.value?.sync(into: stopHost.value!, manual: false))
+            stopResult.done = true
+        }
+        var firstClipMeasured = false
+        pump { firstClipMeasured = firstMeasured.wait(timeout: .now()) == .success; return firstClipMeasured }
+        MainActor.assumeIsolated { _ = stopCoordinator.value?.setImportEnabled(false, on: stopHost.value!) }
+        switchTurnedOff.signal()
+        pump { stopResult.done }
+        MainActor.assumeIsolated {
+            t.expect(
+                firstClipMeasured && measuredFiles.value == 1 && stopResult.value == .some(.some(.disabled))
+                    && stopHost.value?.history.isEmpty == true && stopHost.value?.persistCount == 0
+                    && !FileManager.default.fileExists(atPath: dir.appendingPathComponent("stop-ids.json").path),
+                "opt-in: turning the switch off while a pass is measuring recordings stops it before the next one is opened (1 of 4 measured); the result is .disabled and no speaking time is saved"
+            )
+        }
+
+        // The stop request does not outlive the pass: with the switch on again, the next pass measures every recording.
+        let againResult = Box<TypelessSyncResult??>(nil)
+        Task { @MainActor in
+            let task = stopCoordinator.value?.setImportEnabled(true, on: stopHost.value!)
+            againResult.value = .some(await task?.value)
+            againResult.done = true
+        }
+        pump { againResult.done }
+        MainActor.assumeIsolated {
+            let speaking = stopHost.value?.history.compactMap(\.speakingSeconds) ?? []
+            t.expect(
+                againResult.value == .some(.some(.imported(4))) && measuredFiles.value == 5
+                    && speaking.count == 4 && speaking.allSatisfy { abs($0 - 1.5) <= 0.02 },
+                "opt-in: with the switch on again the next pass is not stopped: it imports the 4 dictations and measures all 4 recordings (1.5 s of speaking in each 2.0 s clip)"
+            )
+        }
+
+        // The switch turned off between the request for a pass and its start: nothing is opened at all, and the stop request is not
+        // lost to the pass clearing it when it starts. The second task is queued right behind the sync, so it runs after the sync
+        // has made its pass and before that pass starts.
+        let raceMeasured = Counter()
+        var racingConfig = makeConfig("race-ids.json")
+        racingConfig.databaseURL = stopFixture.url
+        racingConfig.recordingsURL = stopFolder
+        racingConfig.measureFile = { url in
+            raceMeasured.increment()
+            return SpeakingTimeMeter.measure(fileAt: url)
+        }
+        let racing = racingConfig
+        let readsBeforeRace = reads.value
+        let raceHost = Box<FakeHost?>(nil)
+        let raceCoordinator = Box<TypelessSyncCoordinator?>(nil)
+        let raceResult = Box<TypelessSyncResult??>(nil)
+        MainActor.assumeIsolated {
+            raceHost.value = FakeHost(history: [], importEnabled: true)
+            raceCoordinator.value = TypelessSyncCoordinator(configuration: racing)
+        }
+        Task { @MainActor in
+            raceResult.value = .some(await raceCoordinator.value?.sync(into: raceHost.value!, manual: false))
+            raceResult.done = true
+        }
+        Task { @MainActor in _ = raceCoordinator.value?.setImportEnabled(false, on: raceHost.value!) }
+        pump { raceResult.done }
+        MainActor.assumeIsolated {
+            t.expect(
+                raceResult.value == .some(.some(.disabled)) && reads.value == readsBeforeRace && raceMeasured.value == 0
+                    && raceHost.value?.history.isEmpty == true,
+                "opt-in: if the switch is turned off after a sync was requested and before its pass starts, the pass opens neither the database nor any recording"
+            )
+        }
+    }
+
+    // MARK: - Recordings: which file may be read
+
+    /// `TypelessRecordings.audioURL` decides which audio file a dictation is measured from. Only paths that end up inside the
+    /// Recordings folder may be read, whatever the database says: stored paths that point elsewhere, `..` segments, links (to a
+    /// file or to a folder) and look-alike folder names must all fall back to `<id>.ogg` or to nothing.
+    private static func recordingPathTests(_ t: Checker, sandbox: URL) {
+        let fm = FileManager.default
+        let root = makeDirectory(sandbox, "rec paths")      // with a space, like "Application Support"
+        let recordings = makeDirectory(root, "Recordings")
+        let elsewhere = makeDirectory(root, "Elsewhere")
+        let lookalike = makeDirectory(root, "Recordings-copy")
+        let insideFile = recordings.appendingPathComponent("inside.ogg")
+        let outsideFile = elsewhere.appendingPathComponent("outside.ogg")
+        let lookalikeFile = lookalike.appendingPathComponent("copy.ogg")
+        for url in [insideFile, outsideFile, lookalikeFile] { try? Data("x".utf8).write(to: url) }
+        let fileLink = recordings.appendingPathComponent("link.ogg")
+        let folderLink = recordings.appendingPathComponent("folder-link")
+        try? fm.createSymbolicLink(at: fileLink, withDestinationURL: outsideFile)
+        try? fm.createSymbolicLink(at: folderLink, withDestinationURL: elsewhere)
+        let elsewhereBefore = fingerprint(ofDirectory: elsewhere)
+
+        func pick(_ id: String, _ stored: String) -> URL? {
+            TypelessRecordings.audioURL(id: id, storedPath: stored, in: recordings)
+        }
+        func inode(_ url: URL?) -> UInt64? {
+            guard let url else { return nil }
+            var info = stat()
+            return stat(url.path, &info) == 0 ? UInt64(info.st_ino) : nil
+        }
+        /// True when `url` is `<Recordings>/<name>` (the folder compared after resolving links, the file need not exist).
+        func isInRecordings(_ url: URL?, named name: String) -> Bool {
+            guard let url else { return false }
+            return url.lastPathComponent == name
+                && url.deletingLastPathComponent().resolvingSymlinksInPath().path == recordings.resolvingSymlinksInPath().path
+        }
+
+        t.expect(inode(pick("abc", insideFile.path)) == inode(insideFile) && inode(insideFile) != nil, "recordings: a stored path that is inside the Recordings folder is used")
+        t.expect(isInRecordings(pick("abc", ""), named: "abc.ogg") && isInRecordings(pick("abc", "  \n"), named: "abc.ogg"), "recordings: with no stored path the file is <Recordings>/<id>.ogg")
+        t.expect(isInRecordings(pick("abc", outsideFile.path), named: "abc.ogg"), "recordings: a stored path outside the folder is not used; <id>.ogg is")
+        t.expect(isInRecordings(pick("abc", recordings.path + "/../Elsewhere/outside.ogg"), named: "abc.ogg"), "recordings: a stored path that climbs out with .. is not used")
+        t.expect(isInRecordings(pick("abc", recordings.path + "/./../Elsewhere/./outside.ogg"), named: "abc.ogg"), "recordings: ... however the . and .. segments are mixed")
+        t.expect(isInRecordings(pick("abc", fileLink.path), named: "abc.ogg"), "recordings: a link inside the folder that points to a file outside is not followed")
+        t.expect(pick("link", fileLink.path) == nil && pick("link", "") == nil, "recordings: nothing is returned when <id>.ogg is such a link too")
+        t.expect(isInRecordings(pick("abc", folderLink.path + "/outside.ogg"), named: "abc.ogg"), "recordings: a path through a linked folder that leads outside is not used")
+        t.expect(pick("folder-link/outside", "") == nil, "recordings: an id that goes through a linked folder leads nowhere")
+        t.expect(isInRecordings(pick("abc", lookalikeFile.path), named: "abc.ogg"), "recordings: a folder that only starts with the same name (Recordings-copy) is not inside")
+        t.expect(isInRecordings(pick("abc", recordings.path), named: "abc.ogg") && isInRecordings(pick("abc", recordings.path + "/"), named: "abc.ogg"), "recordings: the Recordings folder itself is not a recording")
+        // A relative path would mean "relative to wherever the process happens to be", so it is never used: not even when that is
+        // the Recordings folder itself.
+        let workingDirectory = fm.currentDirectoryPath
+        fm.changeCurrentDirectoryPath(recordings.path)
+        let relative = pick("abc", "inside.ogg")
+        fm.changeCurrentDirectoryPath(workingDirectory)
+        t.expect(isInRecordings(relative, named: "abc.ogg") && isInRecordings(pick("abc", "~/inside.ogg"), named: "abc.ogg"), "recordings: a relative stored path (or one starting with ~) is not used")
+        t.expect(pick("../Elsewhere/outside", "") == nil && pick("../outside", outsideFile.path) == nil, "recordings: an id with .. cannot lead out of the folder")
+        t.expect(fingerprint(ofDirectory: elsewhere) == elsewhereBefore, "recordings: deciding on paths touches nothing outside the folder")
+    }
+
+    // MARK: - Speaking times from the recordings
+
+    private struct SyncSnapshot {
+        var result: TypelessSyncResult?
+        var banner = ""
+        var writes = 0
+        var count = 0
+        /// Text -> speaking seconds, for the records that have one.
+        var speaking: [String: Double] = [:]
+    }
+
+    @MainActor
+    private static func snapshot(of host: FakeHost, _ result: TypelessSyncResult?) -> SyncSnapshot {
+        var snap = SyncSnapshot(result: result, banner: host.statusBanner, writes: host.persistCount, count: host.history.count)
+        for record in host.history {
+            if let seconds = record.speakingSeconds { snap.speaking[record.polishedText] = seconds }
+        }
+        return snap
+    }
+
+    /// Selection of the recordings to measure, the speaking times of new and of already imported records, and the sync outcome
+    /// when only speaking times were filled in. The clips are WAV files in a throw-away Recordings folder; the fixture rows
+    /// reach them through `audio_local_path`.
+    private static func speakingTimeTests(_ t: Checker, sandbox: URL) {
+        let dir = makeDirectory(sandbox, "speaking")
+        let recordings = makeDirectory(dir, "Recordings")
+        let elsewhere = makeDirectory(dir, "Elsewhere")
+        let tempRoot = makeDirectory(sandbox, "speaking-tmp")
+        let dbURL = dir.appendingPathComponent("typeless.db")
+
+        // "Hello from Typeless." speaks 4.0 s of 5.0 s; "Second dictation" speaks all of its 2.2 s (two 0.2 s gaps stay in).
+        // "  padded with spaces  " has its clip outside the folder, "no fractional seconds" has no clip at all.
+        let helloID = "9F1B7C52-3D2A-4E7B-8C11-0A5D6E7F8091"
+        let helloClip = recordings.appendingPathComponent("hello.wav")
+        let secondClip = recordings.appendingPathComponent("second.wav")
+        let strayClip = elsewhere.appendingPathComponent("stray.wav")
+        let wroteClips = SpeakingTestAudio.writeWAV(SpeakingTestAudio.tone(2) + SpeakingTestAudio.hiss(1) + SpeakingTestAudio.tone(2), to: helloClip)
+            && SpeakingTestAudio.writeWAV(SpeakingTestAudio.tone(0.6) + SpeakingTestAudio.hiss(0.2) + SpeakingTestAudio.tone(0.6) + SpeakingTestAudio.hiss(0.2, seed: 2) + SpeakingTestAudio.tone(0.6), to: secondClip)
+            && SpeakingTestAudio.writeWAV(SpeakingTestAudio.tone(2) + SpeakingTestAudio.hiss(1) + SpeakingTestAudio.tone(2), to: strayClip)
+        t.expect(wroteClips, "fixture: three WAV clips could be written")
+
+        var rows = canonicalRows
+        rows[0].audioPath = helloClip.path
+        rows[1].audioPath = secondClip.path
+        rows[2].audioPath = strayClip.path
+        guard let fixture = FixtureDB(url: dbURL, wal: false, rows: rows) else {
+            t.expect(false, "fixture: database for the speaking-time tests could be created")
+            return
+        }
+        fixture.close()
+        let tableRows = readerRows(rows)
+        let recordID = TypelessMapper.recordID(forTypelessID:)
+        let helloRecord = recordID(helloID)
+        let secondRecord = recordID("row-two")
+        let eligibleIDs = [helloID, "row-two", "row-three", "noms-1"]
+        let recordingsBefore = fingerprint(ofDirectory: recordings)
+        let elsewhereBefore = fingerprint(ofDirectory: elsewhere)
+
+        // Which dictations are measured, and from which files.
+        let fresh = TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: [], needing: [], historyCap: 1000, in: recordings)
+        t.expect(Set(fresh.keys) == [helloRecord, secondRecord], "measure: new dictations are measured when their file is inside the Recordings folder; one whose clip is outside, or missing, stays unknown")
+        t.expect(abs((fresh[helloRecord] ?? -1) - 4.0) <= 0.02 && abs((fresh[secondRecord] ?? -1) - 2.2) < 1e-9, "measure: the speaking times are those of the clips (4.0 of 5.0 s, and 2.2 of 2.2 s)")
+        let imported = Set(eligibleIDs)
+        t.expect(TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: imported, needing: [], historyCap: 1000, in: recordings).isEmpty, "measure: dictations that are already imported are not measured again unless a record needs it")
+        let backfill = TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: imported, needing: [secondRecord, recordID("row-three"), UUID()], historyCap: 1000, in: recordings)
+        t.expect(Set(backfill.keys) == [secondRecord], "measure: a record in the history that has no speaking time is measured from its dictation's clip (and only that one)")
+        let capped = TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: [], needing: [], historyCap: 1, in: recordings)
+        t.expect(Set(capped.keys) == [helloRecord] && TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: [], needing: [], historyCap: 0, in: recordings).isEmpty, "measure: only the newest dictations that still fit in the history are measured")
+        t.expect(TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: [], needing: [], historyCap: 1000, in: dir.appendingPathComponent("no-such-folder")).isEmpty, "measure: a missing Recordings folder measures nothing")
+        // `shouldContinue` is asked before each recording. The first "no" ends the loop, and what was measured until then comes back.
+        var asked = 0
+        let stopped = TypelessRecordings.measureSpeakingTimes(rows: tableRows, importedIDs: [], needing: [], historyCap: 1000, in: recordings, shouldContinue: { asked += 1; return asked < 2 })
+        t.expect(Set(stopped.keys) == [helloRecord] && asked == 2, "measure: it asks before each recording, and at the first no it stops and returns what was measured so far (here the first dictation only, though the second has a clip too)")
+
+        // Records that already have a speaking time keep it.
+        var history = [record(10, "has one"), record(9, "has none"), record(8, "unknown to the measurements")]
+        history[0].speakingSeconds = 99
+        history[1].id = helloRecord
+        history[0].id = secondRecord
+        let filled = TypelessMerger.fillSpeakingTimes(in: &history, from: fresh)
+        t.expect(filled == 1 && history[0].speakingSeconds == 99 && abs((history[1].speakingSeconds ?? -1) - 4.0) <= 0.02 && history[2].speakingSeconds == nil, "fill: a record without a speaking time gets the measured one; an existing value is never replaced")
+
+        // End to end through the coordinator (the reader thread measures, the main actor merges and writes once).
+        @Sendable func makeConfig(_ idsName: String, recordings folder: URL) -> TypelessSyncCoordinator.Configuration {
+            var config = TypelessSyncCoordinator.Configuration()
+            config.databaseURL = dbURL
+            config.recordingsURL = folder
+            config.store = TypelessImportedIDStore(url: dir.appendingPathComponent(idsName))
+            config.readOptions = readOptions(tempRoot: tempRoot)
+            return config
+        }
+
+        // A new import carries the speaking times and is written once.
+        let fresh1 = makeConfig("new-ids.json", recordings: recordings)
+        let importSnapshots: [SyncSnapshot] = runOnMain([]) {
+            let host = FakeHost(history: [record(1795557000, "TZ dictation")])
+            let result = await TypelessSyncCoordinator(configuration: fresh1).sync(into: host, manual: false)
+            return [snapshot(of: host, result)]
+        }
+        let imp = importSnapshots.first
+        t.expect(imp?.result == .imported(4) && imp?.writes == 1 && imp?.count == 5 && imp?.banner == "✅ Synced 4 dictations from Typeless", "speaking times: a first sync imports the dictations as before (4 of them, one write, the import banner)")
+        t.expect(Set(imp?.speaking.keys.map { $0 } ?? []) == ["Hello from Typeless.", "Second dictation"] && abs((imp?.speaking["Hello from Typeless."] ?? -1) - 4.0) <= 0.02 && abs((imp?.speaking["Second dictation"] ?? -1) - 2.2) < 1e-9, "speaking times: imported records come with the speaking time of their clip; the others (and the Nevertype record) have none")
+
+        // Records imported while their audio was not there get their speaking time on a later sync.
+        let backfillIDs = "backfill-ids.json"
+        let withoutAudio = makeConfig(backfillIDs, recordings: dir.appendingPathComponent("no-recordings-yet", isDirectory: true))
+        let withAudio = makeConfig(backfillIDs, recordings: recordings)
+        let flow: [SyncSnapshot] = runOnMain([]) {
+            var snaps: [SyncSnapshot] = []
+            let host = FakeHost(history: [])
+            snaps.append(snapshot(of: host, await TypelessSyncCoordinator(configuration: withoutAudio).sync(into: host, manual: false)))
+            host.statusBanner = ""
+            snaps.append(snapshot(of: host, await TypelessSyncCoordinator(configuration: withAudio).sync(into: host, manual: false)))
+            snaps.append(snapshot(of: host, await TypelessSyncCoordinator(configuration: withAudio).sync(into: host, manual: true)))
+            // A value that is there is not replaced, and a record the user deleted does not come back.
+            if let index = host.history.firstIndex(where: { $0.polishedText == "Hello from Typeless." }) { host.history[index].speakingSeconds = 99 }
+            host.history.removeAll { $0.polishedText == "Second dictation" }
+            snaps.append(snapshot(of: host, await TypelessSyncCoordinator(configuration: withAudio).sync(into: host, manual: true)))
+            return snaps
+        }
+        t.expect(flow.count == 4 && flow[0].result == .imported(4) && flow[0].speaking.isEmpty && flow[0].writes == 1, "backfill: imported while the audio is missing, the 4 records have no speaking time")
+        t.expect(flow.count == 4 && flow[1].result == .upToDate && flow[1].writes == 2 && flow[1].count == 4 && Set(flow[1].speaking.keys) == ["Hello from Typeless.", "Second dictation"], "backfill: a later sync finds the audio, fills in the two speaking times that can be measured, and writes the history again")
+        t.expect(flow.count == 4 && abs((flow[1].speaking["Hello from Typeless."] ?? -1) - 4.0) <= 0.02 && abs((flow[1].speaking["Second dictation"] ?? -1) - 2.2) < 1e-9, "backfill: the values are the speaking times of the clips")
+        t.expect(flow.count == 4 && flow[1].banner.isEmpty, "backfill: filling in speaking times shows no \"Synced N dictations\" banner")
+        t.expect(flow.count == 4 && flow[2].result == .upToDate && flow[2].writes == 2 && flow[2].banner == "✅ Typeless history is already up to date", "backfill: a manual sync afterwards says it is up to date and writes nothing")
+        t.expect(flow.count == 4 && flow[3].result == .upToDate && flow[3].writes == 2 && flow[3].speaking == ["Hello from Typeless.": 99] && flow[3].count == 3, "backfill: a speaking time that is already there is kept, and a record deleted in Nevertype is not brought back")
+        t.expect(TypelessImportedIDStore(url: dir.appendingPathComponent(backfillIDs)).load() == imported, "backfill: the imported-ids file holds the four Typeless ids, as without it")
+
+        t.expect(fingerprint(ofDirectory: recordings) == recordingsBefore && fingerprint(ofDirectory: elsewhere) == elsewhereBefore, "recordings: after all of this the Recordings folder and the folder next to it are byte-for-byte unchanged, and nothing was added to them")
+    }
+
+    // MARK: - A Typeless without the audio_local_path column
+
+    /// An older Typeless, or a later one that dropped the column, still imports as before; every recording path is empty. Both
+    /// ways of reading (the direct read-only open and the private copy) look at the table's columns before they query it.
+    private static func missingAudioColumnTests(_ t: Checker, sandbox: URL) {
+        let dir = makeDirectory(sandbox, "no-audio-column")
+        let tempRoot = makeDirectory(sandbox, "no-audio-column-tmp")
+        let recordings = makeDirectory(dir, "Recordings")
+        let dbURL = dir.appendingPathComponent("typeless.db")
+        let helloID = "9F1B7C52-3D2A-4E7B-8C11-0A5D6E7F8091"
+        guard let fixture = FixtureDB(url: dbURL, wal: false, rows: canonicalRows, audioColumn: false) else {
+            t.expect(false, "fixture: database without an audio_local_path column could be created")
+            return
+        }
+        t.expect(!fixture.exec("SELECT audio_local_path FROM history_v2") && fixture.exec("SELECT id, status, mode, refined_text, duration, created_at FROM history_v2"), "fixture: the table has the other columns but no audio_local_path")
+        fixture.close()
+        let before = fingerprint(ofDirectory: dir)
+
+        func check(_ label: String, forceCopy: Bool) {
+            let outcome = try? TypelessDatabaseReader.read(from: dbURL, options: readOptions(tempRoot: tempRoot, forceCopy: forceCopy))
+            if case .rows(let rows, let usedCopy)? = outcome {
+                let hello = rows.first { $0.id == helloID }
+                t.expect(rows.count == 11 && usedCopy == forceCopy && rows.allSatisfy { $0.audioLocalPath.isEmpty }, "no audio column: \(label) reads all 11 rows, each with an empty recording path")
+                t.expect(hello?.refinedText == "Hello from Typeless." && hello?.duration == 4.5 && hello?.createdAt == "2026-11-24T21:21:24.992Z" && hello?.status == "completed", "no audio column: \(label) returns the other columns intact")
+            } else {
+                t.expect(false, "no audio column: \(label) reads the database")
+            }
+        }
+        check("the direct read-only open", forceCopy: false)
+        check("the private copy", forceCopy: true)
+        t.expect(fileNames(in: tempRoot).isEmpty, "no audio column: the private copy is deleted afterwards")
+
+        let dry = TypelessHistoryImporter.dryRunReport(databaseURL: dbURL, store: TypelessImportedIDStore(url: dir.appendingPathComponent("dry-ids.json")), options: readOptions(tempRoot: tempRoot))
+        t.expect(dry.status == 0 && dry.lines.joined(separator: "\n").contains("Eligible rows:      4 "), "no audio column: the dry run still counts the 4 eligible rows")
+
+        // The whole sync: the dictations are imported (with no speaking time, because no recording path is known).
+        var config = TypelessSyncCoordinator.Configuration()
+        config.databaseURL = dbURL
+        config.recordingsURL = recordings
+        config.store = TypelessImportedIDStore(url: dir.appendingPathComponent("ids.json"))
+        config.readOptions = readOptions(tempRoot: tempRoot)
+        let syncConfig = config
+        let snapshots: [SyncSnapshot] = runOnMain([]) {
+            let host = FakeHost(history: [])
+            let result = await TypelessSyncCoordinator(configuration: syncConfig).sync(into: host, manual: true)
+            return [snapshot(of: host, result)]
+        }
+        t.expect(snapshots.first?.result == .imported(4) && snapshots.first?.writes == 1 && snapshots.first?.count == 4 && snapshots.first?.speaking.isEmpty == true && snapshots.first?.banner == "✅ Synced 4 dictations from Typeless", "no audio column: a sync imports the 4 dictations as before, with no speaking times")
+        t.expect(fingerprint(ofDirectory: dir).filter { $0.key != "ids.json" && $0.key != "dry-ids.json" } == before, "no audio column: the database and its folder are untouched")
     }
 
     // MARK: - Dry run

@@ -490,6 +490,10 @@ public struct DictationRecord: Identifiable, Codable {
     public var targetAppName: String
     public var mode: DictationMode
     public var matchedTerms: [String]
+    /// Seconds in the recording during which the user was actually speaking, pauses left out (see `SpeakingTimeMeter`). nil when
+    /// it was never measured: a record saved before this existed, or a Typeless dictation whose audio file is not there. The key
+    /// is left out of history.json while it is nil, and a history.json without the key decodes to nil.
+    public var speakingSeconds: Double?
 
     public var characterCount: Int {
         polishedText.count
@@ -504,7 +508,8 @@ public struct DictationRecord: Identifiable, Codable {
         polishLatencyMs: Int,
         targetAppName: String,
         mode: DictationMode = .dictate,
-        matchedTerms: [String] = []
+        matchedTerms: [String] = [],
+        speakingSeconds: Double? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -515,6 +520,8 @@ public struct DictationRecord: Identifiable, Codable {
         self.targetAppName = targetAppName
         self.mode = mode
         self.matchedTerms = matchedTerms
+        // A value that cannot be written to JSON (NaN, infinity) would stop history.json from saving: treat it as not measured.
+        self.speakingSeconds = speakingSeconds.flatMap { $0.isFinite ? max(0, $0) : nil }
     }
 }
 

@@ -34,7 +34,7 @@ Settings → Output → Formatting style:
 
 Nevertype lives in the menu bar. Its window has four pages:
 
-- **Home.** Totals for words dictated, time saved, average speed and dictation time, a calendar of your activity, the apps you dictate into most, and a box where you can try dictation.
+- **Home.** Totals for words dictated, time saved, average speed and dictation time, a calendar of your activity, the apps you dictate into most, and a box where you can try dictation. Average speed counts only the time you were speaking: pauses of 0.3 seconds or more are left out. Dictations saved before Nevertype measured speaking time have none, and once newer ones have it, the older ones are not part of the speed.
 - **History.** Your latest 1,000 dictations, with the raw transcript available for each one. They are kept on your Mac.
 - **Dictionary.** Names and terms you say often, plus the forms they are often misheard as. Add them by hand, import them from pasted text, a notes folder or your browser's page titles (see [Privacy](#privacy)), or let Nevertype learn from the corrections you make.
 - **Settings.** Speech model, cleanup model, shortcut, output options and permissions.
@@ -117,9 +117,10 @@ Audio and text stay on your Mac unless you choose a cloud provider.
 If Typeless is installed on this Mac, Nevertype can copy your past dictations into its History. This is off until you turn it on.
 
 - **Turning it on.** When `~/Library/Application Support/Typeless/typeless.db` exists, Settings shows **Import history from Typeless** in an Import section. Turning it on imports your past dictations right away. After that, Nevertype checks for new ones when it starts and when you open History, and the menu on the History page gets **Sync from Typeless** for a manual sync. Turning it off stops all of this.
-- **While it is off,** Nevertype does not open the Typeless database. It only checks that the file exists, to decide whether to show the switch.
+- **While it is off,** Nevertype does not open the Typeless database or its recordings. It only checks that the database file exists, to decide whether to show the switch.
 - It reads the database read-only and never writes to it. If the database cannot be opened read-only, for example because it is locked, Nevertype reads a temporary copy and deletes the copy afterwards.
 - Only finished voice dictations that have text are imported: the text, the length of the recording and the date.
+- **Speaking time.** Besides the text, the length of the recording and the date, Nevertype measures how long you spoke in each dictation, from Typeless's recording of it in `~/Library/Application Support/Typeless/Recordings`. It reads the file on your Mac, read-only, and never copies, keeps or sends the audio. If a recording is missing or macOS cannot read it, the dictation is still imported, without a speaking time. Dictations imported before Nevertype measured speaking time get it at the next sync.
 - Each dictation is imported once. If you delete an imported dictation in Nevertype, it does not come back.
 - Imported entries show "Typeless" as their app in History.
 
@@ -130,6 +131,7 @@ If Typeless is installed on this Mac, Nevertype can copy your past dictations in
 - It can import your dictation history from Typeless, if you turn that on.
 - When no text field has focus, a Copy pill replaces the clipboard fallback: the text is offered on the pill and copied only when you click Copy.
 - A cloud speech engine never receives clipboard text. Nevertype reads the clipboard as a hint only when speech recognition runs on this Mac, and it skips contents that password managers mark as private.
+- The average speed on the Home page counts only the time you were speaking, not the pauses.
 - There is no account or sign-in, and no update check. The Windows app, the website and the cloud backend of the original project are not part of this repository.
 
 ## Credits

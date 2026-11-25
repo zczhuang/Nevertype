@@ -27,8 +27,8 @@ enum TZUISelfTests {
         func date(_ y: Int, _ m: Int, _ d: Int, _ h: Int = 12, _ min: Int = 0) -> Date {
             cal.date(from: DateComponents(year: y, month: m, day: d, hour: h, minute: min)) ?? Date()
         }
-        func record(_ day: Date, text: String = "Hello there", seconds: Double = 10, app: String = "Notes", mode: DictationMode = .dictate) -> DictationRecord {
-            DictationRecord(timestamp: day, rawTranscript: text, polishedText: text, durationSeconds: seconds, polishLatencyMs: 100, targetAppName: app, mode: mode)
+        func record(_ day: Date, text: String = "Hello there", seconds: Double = 10, speaking: Double? = nil, app: String = "Notes", mode: DictationMode = .dictate) -> DictationRecord {
+            DictationRecord(timestamp: day, rawTranscript: text, polishedText: text, durationSeconds: seconds, polishLatencyMs: 100, targetAppName: app, mode: mode, speakingSeconds: speaking)
         }
 
         // 1. Word counting: Latin tokens, CJK characters, markers
@@ -68,6 +68,28 @@ enum TZUISelfTests {
         expect(abs(totals.dictationMinutes - 1.005) < 0.0001, "totals counts every record in total dictation time")
         expect(abs(totals.savedMinutes - (125.0 / 40.0 - 1.005)) < 0.0001, "totals time saved assumes 40 WPM typing")
         expect(TZStats.totals([]).wpm == 0 && TZStats.totals([]).savedMinutes == 0, "totals of empty history are zero")
+
+        // 3b. Speed on speaking time: once a record has one, pauses do not slow the average down
+        let spoken = [
+            record(date(2026, 11, 24), text: sixty, seconds: 30, speaking: 20),
+            record(date(2026, 11, 24, 13), text: sixty, seconds: 30, speaking: 20),
+            record(date(2026, 11, 24, 14), text: "one two three four five", seconds: 10, speaking: 0.3),
+            record(date(2026, 11, 24, 15), text: sixty, seconds: 30)
+        ]
+        let spokenTotals = TZStats.totals(spoken)
+        expect(spokenTotals.wpm == 180, "totals WPM uses speaking time when records have it (120 words in 40 s of speech, not in 60 s of recording)")
+        expect(
+            spokenTotals.words == 185 && abs(spokenTotals.dictationMinutes - 100.0 / 60.0) < 0.0001 && abs(spokenTotals.savedMinutes - (185.0 / 40.0 - 100.0 / 60.0)) < 0.0001,
+            "totals words, dictation time and time saved stay on recording time"
+        )
+        expect(TZStats.totals([spoken[0], spoken[1], spoken[2]]).wpm == 180, "totals WPM ignores a record with under 0.5 s of speaking time")
+        expect(TZStats.totals([spoken[0], spoken[1], spoken[3]]).wpm == 180, "totals WPM leaves out a record without a speaking time once other records have one")
+        expect(
+            TZStats.totals([record(date(2026, 11, 24), text: sixty, seconds: 30)]).wpm == 120
+                && TZStats.totals([record(date(2026, 11, 24), text: sixty, seconds: 30), record(date(2026, 11, 24, 13), text: "a b c", seconds: 0.4)]).wpm == 120,
+            "totals WPM falls back to recording time (records of at least 0.5 s) when no record has a speaking time"
+        )
+        expect(TZStats.totals([record(date(2026, 11, 24), text: sixty, seconds: 30, speaking: 0.2)]).wpm == 0, "totals WPM is 0 when the only speaking times are under 0.5 s")
 
         // 4. Activity: streaks relative to a fixed day
         let now = date(2026, 11, 24, 15)

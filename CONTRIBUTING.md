@@ -36,6 +36,7 @@ For development, the app binary has headless modes that do not start the app or 
 - `--render-ui <dir>` draws each page of the window to PNG files, with sample data, in a throw-away home folder.
 - `--dictate-file <file.wav>` runs a recording through the speech model and the cleanup model and prints both results. It calls the configured cleanup endpoint: a warm-up, then one cleanup request.
 - `--typeless-import-dry-run` prints counts (no text) from the Typeless database, read-only. It ignores the import switch in Settings, because you run it yourself.
+- `--speaking-time <file> [<file> ...]` prints the recording time and the speaking time (pauses left out) of each audio file, then the totals. It only reads the files you name.
 
 ## Project layout
 

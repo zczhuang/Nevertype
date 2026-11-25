@@ -14,6 +14,10 @@ enum TypeZeroMain {
         if CommandLine.arguments.contains("--typeless-import-dry-run") {
             exit(TypelessHistoryImporter.runDryRun())
         }
+        // Developer check of the speaking-time rule: prints the recording and speaking seconds of the audio files that follow the flag.
+        if CommandLine.arguments.contains("--speaking-time") {
+            exit(SpeakingTimeMeter.runCLI(arguments: Array(CommandLine.arguments.dropFirst())))
+        }
         if CommandLine.arguments.contains("--bench-asr") {
             exit(SelfTestSuite.runDualASRSmokeBenchmark())
         }
