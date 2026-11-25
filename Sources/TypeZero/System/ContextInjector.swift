@@ -17,7 +17,9 @@ public struct ActiveScreenContext {
     public let windowTitle: String
     public let selectedText: String
     public let precedingText: String
-    public let hasFocusedTextInput: Bool
+    /// What the focus check found when the dictation started (`ContextInjector.focusedTextInputStatus`). `.unknown` for a context
+    /// nobody checked: the fast first guess in `AppState`, the headless CLI, tests.
+    public var focusStatus: FocusedTextInputStatus = .unknown
 
     public var isStrictShellTerminal: Bool {
         let lower = bundleID.lowercased() + " " + appName.lowercased()
@@ -65,8 +67,7 @@ public struct ActiveScreenContext {
         bundleID: "",
         windowTitle: "",
         selectedText: "",
-        precedingText: "",
-        hasFocusedTextInput: true
+        precedingText: ""
     )
 }
 
@@ -78,6 +79,8 @@ public final class LiveInputSession: @unchecked Sendable {
     private static let pacerQueue = DispatchQueue(label: "io.github.typezero.typewriter.pacer", qos: .userInteractive)
 
     private var context: ActiveScreenContext
+    /// False until `updateContext` delivers the first real focus check: the context given to `init` may only be a guess.
+    private var focusChecked: Bool
     /// Characters actually emitted to the OS input box so far
     private var emittedText: String = ""
     /// Characters confirmed by Local Agreement, waiting in the smooth adaptive cruise queue
@@ -100,14 +103,18 @@ public final class LiveInputSession: @unchecked Sendable {
 
     private static let unstableTrailingPunctuation = CharacterSet(charactersIn: "。，、！？；：.,!?;:… ")
 
-    public init(context: ActiveScreenContext) {
+    /// `awaitingFocusCheck`: `context` is only a first guess and the real focus check is still running; nothing is typed live
+    /// until `updateContext` brings its result.
+    public init(context: ActiveScreenContext, awaitingFocusCheck: Bool = false) {
         self.context = context
+        self.focusChecked = !awaitingFocusCheck
         startSmoothTypewriterPacer()
     }
 
     public func updateContext(_ newContext: ActiveScreenContext) {
         stateLock.lock()
         self.context = newContext
+        self.focusChecked = true
         stateLock.unlock()
     }
 
@@ -133,6 +140,11 @@ public final class LiveInputSession: @unchecked Sendable {
             return false
         }
         return true
+    }
+
+    /// Whether keystrokes may be sent while the user speaks: only once the focus check has run, and not when it found no text input.
+    static func allowsLiveTyping(focusChecked: Bool, status: FocusedTextInputStatus) -> Bool {
+        focusChecked && DictationDelivery.allowsLiveTyping(status: status)
     }
 
     public func abortBecauseUserSubmitted() {
@@ -242,7 +254,10 @@ public final class LiveInputSession: @unchecked Sendable {
               AXIsProcessTrusted() else {
             return false
         }
-        if !ctx.hasFocusedTextInput && !ContextInjector.isLikelyEditableFocusNow() {
+        // Streaming the cleanup result types into whatever has focus. When nothing was typed live yet (the dictation began with no
+        // text input in focus, or the first words never got typed) this would be the first keystroke, so look again first.
+        if currentDraft.isEmpty,
+           ContextInjector.focusedTextInputStatus(tracePhase: "stream") == .notEditable {
             return false
         }
         return Self.shouldUseLiveSSEStream(draft: currentDraft, context: ctx)
@@ -499,11 +514,18 @@ public final class LiveInputSession: @unchecked Sendable {
     public func updateLiveText(_ rawHypothesis: String, flushTrailingChar: Bool = false, isCloudStream: Bool = false) -> Bool {
         stateLock.lock()
         let ctx = self.context
+        let focusChecked = self.focusChecked
         let isStartOfUtterance = targetConfirmedText.isEmpty
         stateLock.unlock()
 
         guard ContextInjector.isAllowedTarget(bundleID: ctx.bundleID, appName: ctx.appName),
               AXIsProcessTrusted() else {
+            return false
+        }
+        // No keystrokes until the focus check has run, and none for the whole dictation when it found no text input in focus
+        // (a keystroke into Gmail, Finder or a focused button can fire a shortcut). Nothing is lost by skipping a result: every
+        // partial result carries the whole utterance so far, and the cleaned text is delivered at the end either way.
+        guard Self.allowsLiveTyping(focusChecked: focusChecked, status: ctx.focusStatus) else {
             return false
         }
 
@@ -617,9 +639,11 @@ public final class LiveInputSession: @unchecked Sendable {
     }
 
     /// Pass 2 (On stop tap): Stops pacer, flushes any remaining confirmed chars, and applies final text cleanly.
-    /// P4 Safety Vault: Returns `false` if no editable text field accepted the input, keeping `finalText` safely in NSPasteboard!
+    /// Returns `false` when nothing was typed or pasted because there was nowhere to put it (no text input in focus, Accessibility not
+    /// trusted, target not allowed): the caller then offers `finalText` on the Copy pill. The clipboard is never touched here.
+    /// `focusStatus` is the focus check taken when the cleaned text became ready; `nil` takes a fresh one.
     @discardableResult
-    public func finalizeAfterKeyRelease(with finalText: String) -> Bool {
+    public func finalizeAfterKeyRelease(with finalText: String, focusStatus: FocusedTextInputStatus? = nil) -> Bool {
         stopPacer(drainQueue: true)
         stateLock.lock()
         let aborted = abortedByUserSubmit
@@ -636,17 +660,15 @@ public final class LiveInputSession: @unchecked Sendable {
         let prePasteUs: useconds_t = isRichSlowEditor ? 55_000 : 35_000
         let baseRestoreSec: TimeInterval = isRichSlowEditor ? 1.50 : 1.00
 
-        guard ContextInjector.isAllowedTarget(bundleID: ctx.bundleID, appName: ctx.appName),
-              AXIsProcessTrusted() else {
-            ContextInjector.saveToSafetyClipboard(finalText)
-            ContextInjector.appendInjectionTrace("finalize app=\(ctx.bundleID) branch=untrusted emitted=\(alreadyEmitted.count) final=\(finalText.count)")
-            return false
-        }
-
-        // If user never clicked into an input field (e.g. Finder or desktop focused), save directly to Safety Vault clipboard!
-        if !ContextInjector.isLikelyEditableFocusNow() && !ctx.hasFocusedTextInput {
-            ContextInjector.saveToSafetyClipboard(finalText)
-            ContextInjector.appendInjectionTrace("finalize app=\(ctx.bundleID) branch=noFocus emitted=\(alreadyEmitted.count) final=\(finalText.count)")
+        // Nowhere to put the text (Accessibility not trusted, target not allowed, or no text input in focus right now: the user may
+        // have clicked away while speaking): leave the app in front alone, the caller offers the text on the Copy pill.
+        let plan = DictationDelivery.plan(
+            status: focusStatus ?? ContextInjector.focusedTextInputStatus(tracePhase: "finalize"),
+            accessibilityTrusted: AXIsProcessTrusted(),
+            targetAllowed: ContextInjector.isAllowedTarget(bundleID: ctx.bundleID, appName: ctx.appName)
+        )
+        if case .offerCopy(let reason) = plan {
+            ContextInjector.appendInjectionTrace("finalize app=\(ctx.bundleID) branch=\(reason.traceBranch) emitted=\(alreadyEmitted.count) final=\(finalText.count)")
             return false
         }
 
@@ -987,7 +1009,8 @@ public enum ContextInjector {
     private static var manualAXEnabledPIDs: Set<pid_t> = []
 
     /// Enables Chromium/Electron manual accessibility tree once per process so apps like Feishu,
-    /// Cursor, Notion, and Chrome expose accurate text-input & caret AX geometry.
+    /// Cursor, Notion, and Chrome expose accurate text-input & caret AX geometry. Chromium/Electron then report real roles for the
+    /// focused element too, which the focus check (`focusedTextInputStatus`) relies on.
     private static func enableManualAccessibilityIfNeeded(appElem: AXUIElement, pid: pid_t) {
         manualAXLock.lock()
         let alreadyEnabled = manualAXEnabledPIDs.contains(pid)
@@ -1153,7 +1176,178 @@ public enum ContextInjector {
         return nil
     }
 
-    /// Captures frontmost app name, window title, and any highlighted text (for Selected-Text Rewrite mode).
+    // MARK: - Focus check: is a text input in focus?
+
+    private static func axString(_ elem: AXUIElement, _ attribute: String) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(elem, attribute as CFString, &ref) == .success else { return nil }
+        return ref as? String
+    }
+
+    private static func axIsSettable(_ elem: AXUIElement, _ attribute: String) -> Bool {
+        var settable: DarwinBoolean = false
+        guard AXUIElementIsAttributeSettable(elem, attribute as CFString, &settable) == .success else { return false }
+        return settable.boolValue
+    }
+
+    /// Host (lower case) of the page a web area shows, from its AXURL. Only the host is kept, and it is never logged.
+    private static func axPageHost(_ elem: AXUIElement) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(elem, kAXURLAttribute as CFString, &ref) == .success else { return nil }
+        if let url = ref as? URL { return url.host?.lowercased() }
+        if let text = ref as? String { return URL(string: text)?.host?.lowercased() }
+        return nil
+    }
+
+    // MARK: Electron and web content (inputs to rule 5 of the focus check)
+
+    private static let electronLock = NSLock()
+    private static var electronByBundlePath: [String: Bool] = [:]
+
+    /// Whether the app at `bundleURL` is an Electron app: its bundle carries `Contents/Frameworks/Electron Framework.framework`.
+    /// Remembered per bundle path (it does not change while the app stays installed there), so the file system is asked once per app.
+    static func isElectronApp(bundleURL: URL?) -> Bool {
+        guard let bundleURL else { return false }
+        let path = bundleURL.path
+        electronLock.lock()
+        let remembered = electronByBundlePath[path]
+        electronLock.unlock()
+        if let remembered { return remembered }
+
+        let marker = bundleURL.appendingPathComponent("Contents/Frameworks/Electron Framework.framework", isDirectory: true).path
+        let isElectron = FileManager.default.fileExists(atPath: marker)
+        electronLock.lock()
+        if electronByBundlePath.count > 64 { electronByBundlePath.removeAll() }
+        electronByBundlePath[path] = isElectron
+        electronLock.unlock()
+        return isElectron
+    }
+
+    private struct WebProbe {
+        let element: AXUIElement
+        let isWebContent: Bool
+        let host: String?
+        let at: Date
+    }
+    private static let webProbeLock = NSLock()
+    private static var webProbes: [WebProbe] = []
+    /// What was found out about one element stays valid this long, so the check at the end of a dictation costs nothing when the focus has
+    /// not moved since the start (a page's structure around an element does not change in seconds). Only the last few elements are kept.
+    private static let webProbeLifetime: TimeInterval = 30
+    private static let webProbeCapacity = 8
+    /// The longest a walk up the page may run. Cut short, it answers "not web content" (so `.unknown`) and is not remembered.
+    private static let webWalkBudgetMilliseconds = 120
+
+    /// Whether `elem` is part of a web page, and the host that page comes from: follows the AXParent chain up to `WebContentWalk.maxLevels`
+    /// levels and stops at the window (two Accessibility calls per level, each limited to 35 ms, the whole walk to 120 ms).
+    private static func webContent(of elem: AXUIElement) -> (isWebContent: Bool, host: String?) {
+        let now = Date()
+        webProbeLock.lock()
+        webProbes.removeAll { now.timeIntervalSince($0.at) > webProbeLifetime }
+        let remembered = webProbes.first { CFEqual($0.element, elem) }
+        webProbeLock.unlock()
+        if let remembered { return (remembered.isWebContent, remembered.host) }
+
+        let deadline = DispatchTime.now() + .milliseconds(webWalkBudgetMilliseconds)
+        let outcome = WebContentWalk.enclosingWebArea(
+            of: elem,
+            parent: { node in
+                var ref: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &ref) == .success,
+                      let parent = asAXElement(ref) else { return nil }
+                AXUIElementSetMessagingTimeout(parent, 0.035)
+                return parent
+            },
+            role: { axString($0, kAXRoleAttribute) },
+            shouldStop: { DispatchTime.now() > deadline }
+        )
+
+        let result: (isWebContent: Bool, host: String?)
+        switch outcome {
+        case .webArea(let area): result = (true, axPageHost(area))
+        case .outsideWeb: result = (false, nil)
+        case .undetermined: return (false, nil)
+        }
+        webProbeLock.lock()
+        if webProbes.count >= webProbeCapacity { webProbes.removeFirst() }
+        webProbes.append(WebProbe(element: elem, isWebContent: result.isWebContent, host: result.host, at: now))
+        webProbeLock.unlock()
+        return result
+    }
+
+    /// The Accessibility side of the focus check: asks the app for its focused element and copies what the rules need into plain values.
+    /// Also returns the element itself (nil when there is none) for callers that read more from it. No judgement here:
+    /// `FocusedTextInputClassifier.classify` decides.
+    private static func readFocusedElement(of appElement: AXUIElement, bundleID: String, bundleURL: URL?) -> (element: AXUIElement?, facts: FocusedElementFacts) {
+        var facts = FocusedElementFacts(bundleID: bundleID)
+        facts.isElectronApp = isElectronApp(bundleURL: bundleURL)
+        var focusedRef: CFTypeRef?
+        let focusError = AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedRef)
+        guard focusError == .success, let elem = asAXElement(focusedRef) else {
+            // `.noValue`: the app answered and has nothing in focus. Any other error (timeout, unsupported) is a failed read.
+            facts.noFocusedElement = (focusError == .noValue)
+            return (nil, facts)
+        }
+        AXUIElementSetMessagingTimeout(elem, 0.035)
+        facts.role = axString(elem, kAXRoleAttribute)
+        facts.subrole = axString(elem, kAXSubroleAttribute)
+        // The two "is it settable" reads only matter when the role alone does not settle the answer.
+        if !FocusedTextInputClassifier.isDecisive(role: facts.role, subrole: facts.subrole) {
+            facts.selectedTextRangeSettable = axIsSettable(elem, kAXSelectedTextRangeAttribute)
+            facts.valueSettable = axIsSettable(elem, kAXValueAttribute)
+        }
+        // Web content matters (rule 5) in an Electron app or a web browser, and only while the answer is still open: a role that does not
+        // decide on its own (AXGroup, AXWebArea, AXScrollArea ...), nothing settable, and not a window or the application (the tree may
+        // not be ready). A focused web area is web content by itself; anything else is looked up by walking up its parents.
+        if facts.isElectronApp || FocusedTextInputClassifier.isWebBrowser(bundleID: bundleID),
+           !FocusedTextInputClassifier.isDecisive(role: facts.role, subrole: facts.subrole),
+           !facts.selectedTextRangeSettable, !facts.valueSettable,
+           let role = facts.role,
+           role != FocusedTextInputClassifier.windowRole, role != FocusedTextInputClassifier.applicationRole {
+            if role == FocusedTextInputClassifier.webAreaRole {
+                facts.isWebContent = true
+                facts.webAreaHost = axPageHost(elem)
+            } else {
+                let probe = webContent(of: elem)
+                facts.isWebContent = probe.isWebContent
+                facts.webAreaHost = probe.host
+            }
+        }
+        return (elem, facts)
+    }
+
+    /// Whether typing now would land in a text input: asks the front app for its focused element (`FocusedTextInputClassifier` holds
+    /// the rules). A handful of Accessibility round trips, each limited to 35 ms: call it when a decision needs it, not per keystroke.
+    /// `tracePhase` ("start", "stream", "deliver", ...) writes one line with the app, role, subrole and result to the injection trace.
+    ///
+    /// Electron and other Chromium apps build a real accessibility tree only after `AXManualAccessibility` is set (Electron then waits 2 s
+    /// before switching the full tree on). This sets it too, once per process like the pill's caret tracking does, so a read taken after
+    /// the user has spoken sees real roles (AXTextArea for a compose box, AXWebArea for an empty page) where the very first read in a freshly
+    /// launched app can still see only a bare window, which is `.unknown`.
+    public static func focusedTextInputStatus(tracePhase: String? = nil) -> FocusedTextInputStatus {
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let bundleID = frontApp?.bundleIdentifier ?? ""
+        guard isAllowedTarget(bundleID: bundleID, appName: frontApp?.localizedName ?? ""),
+              AXIsProcessTrusted(),
+              let pid = frontApp?.processIdentifier else {
+            if let tracePhase {
+                appendInjectionTrace("focusCheck phase=\(tracePhase) app=\(bundleID) role=none subrole=none status=unknown reason=noAccessibility")
+            }
+            return .unknown
+        }
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, 0.035)
+        enableManualAccessibilityIfNeeded(appElem: appElement, pid: pid)
+        let facts = readFocusedElement(of: appElement, bundleID: bundleID, bundleURL: frontApp?.bundleURL).facts
+        let status = FocusedTextInputClassifier.classify(facts)
+        if let tracePhase {
+            appendInjectionTrace("focusCheck phase=\(tracePhase) \(facts.traceDescription(status: status))")
+        }
+        return status
+    }
+
+    /// Captures frontmost app name, window title, and any highlighted text (for Selected-Text Rewrite mode),
+    /// plus the focus check for this dictation (`focusStatus`, traced as phase `start`).
     public static func captureCurrentContext() -> ActiveScreenContext {
         let frontApp = NSWorkspace.shared.frontmostApplication
         let appName = frontApp?.localizedName ?? "Unknown"
@@ -1162,11 +1356,12 @@ public enum ContextInjector {
         guard isAllowedTarget(bundleID: bundleID, appName: appName),
               AXIsProcessTrusted(),
               let pid = frontApp?.processIdentifier else {
-            return ActiveScreenContext(appName: appName, bundleID: bundleID, windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: false)
+            return ActiveScreenContext(appName: appName, bundleID: bundleID, windowTitle: "", selectedText: "", precedingText: "")
         }
 
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, 0.035)
+        enableManualAccessibilityIfNeeded(appElem: appElement, pid: pid)
 
         var windowTitle = ""
         var focusedWindow: CFTypeRef?
@@ -1181,14 +1376,14 @@ public enum ContextInjector {
 
         var selectedText = ""
         var precedingText = ""
-        var editableFocus = true
-        if bundleID == "com.apple.finder" {
-            editableFocus = false
-        }
+        // Qt / Electron / Canvas apps often report AXWindow/AXApplication even when the compose cursor is active: that is `.unknown`,
+        // which keeps typing. An Electron app's page text or empty page (AXGroup / AXWebArea in web content) is `.notEditable`
+        // (see `FocusedTextInputClassifier`).
+        let (focusedElement, focusFacts) = readFocusedElement(of: appElement, bundleID: bundleID, bundleURL: frontApp?.bundleURL)
+        let focusStatus = FocusedTextInputClassifier.classify(focusFacts)
+        appendInjectionTrace("focusCheck phase=start \(focusFacts.traceDescription(status: focusStatus))")
 
-        var focusedRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-           let elem = asAXElement(focusedRef) {
+        if let elem = focusedElement {
             var selectedRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(elem, kAXSelectedTextAttribute as CFString, &selectedRef) == .success,
                let selStr = selectedRef as? String {
@@ -1201,18 +1396,6 @@ public enum ContextInjector {
                !fullVal.isEmpty {
                 precedingText = String(fullVal.suffix(140))
             }
-            var roleRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(elem, kAXRoleAttribute as CFString, &roleRef) == .success,
-               let role = roleRef as? String {
-                // Only treat genuinely non-editable controls/desktop as non-input;
-                // Qt / Electron / Canvas apps often report AXWindow/AXApplication even when the compose cursor is active.
-                let nonEditableRoles: Set<String> = ["AXDesktop", "AXButton", "AXImage", "AXToolbar"]
-                if nonEditableRoles.contains(role) {
-                    editableFocus = false
-                } else {
-                    editableFocus = true
-                }
-            }
         }
 
         return ActiveScreenContext(
@@ -1221,19 +1404,17 @@ public enum ContextInjector {
             windowTitle: windowTitle,
             selectedText: selectedText,
             precedingText: precedingText,
-            hasFocusedTextInput: editableFocus
+            focusStatus: focusStatus
         )
     }
 
-    public static func isLikelyEditableFocusNow() -> Bool {
-        return captureCurrentContext().hasFocusedTextInput
-    }
-
-    public static func saveToSafetyClipboard(_ text: String) {
-        guard !text.isEmpty else { return }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
+    /// Puts `text` on the pasteboard as plain text and nothing else. Only for an explicit click (the Copy pill, the menu bar's recent
+    /// dictations): dictation never copies anything on its own.
+    @discardableResult
+    public static func copyPlainText(_ text: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        guard !text.isEmpty else { return false }
+        pasteboard.clearContents()
+        return pasteboard.setString(text, forType: .string)
     }
 
     // MARK: - Zero-Modifier Unicode Streaming Delta (Works in Electron/Antigravity/Chrome/Cocoa)

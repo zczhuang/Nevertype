@@ -7,6 +7,12 @@ public final class AppState: ObservableObject {
     @Published public var phase: PipelinePhase = .idle {
         didSet {
             pillController.setVisible(phase != .idle)
+            // Only the Copy pill takes clicks; in every other state the pill lets them through to the app underneath.
+            if case .readyToCopy = phase {
+                pillController.setInteractive(true)
+            } else {
+                pillController.setInteractive(false)
+            }
         }
     }
     @Published public var audioLevel: Float = 0.08
@@ -91,6 +97,8 @@ public final class AppState: ObservableObject {
     @Published public var offlineDownloadStatusText: String = ""
 
     private var idleResetTask: Task<Void, Never>? = nil
+    /// Clock behind the Copy pill's 8 s (paused while the pointer is over the pill).
+    private var copyCountdown = CopyPillCountdown()
     private var pendingAutoMuteTask: Task<Void, Never>? = nil
 
     /// True when the user has typed or saved their own Doubao speech API key.
@@ -1064,13 +1072,13 @@ public final class AppState: ObservableObject {
             bundleID: frontBundle,
             windowTitle: "",
             selectedText: "",
-            precedingText: "",
-            hasFocusedTextInput: frontBundle != "com.apple.finder"
+            precedingText: ""
         )
         activeContext = fastInitialContext
         activeMode = .dictate
         AudioLevelBus.shared.reset()
-        let session: LiveInputSession? = llmConfig.enableLiveInlineTyping ? LiveInputSession(context: fastInitialContext) : nil
+        // The first guess has no focus check yet: the session types nothing until the capture below delivers it (`updateContext`).
+        let session: LiveInputSession? = llmConfig.enableLiveInlineTyping ? LiveInputSession(context: fastInitialContext, awaitingFocusCheck: true) : nil
         liveInputSession = session
         phase = .listening(livePreview: "", mode: .dictate)
         // Start cue first, whatever the auto-mute setting; auto-mute then waits until the cue has played, because muting the
@@ -1266,6 +1274,17 @@ public final class AppState: ObservableObject {
             return
         }
 
+        // Where can the text go? Asked again now instead of trusting the check from the start of the dictation: the user may have clicked
+        // into (or out of) a text field while speaking. The read runs off the main thread (when the focus is not a text field it walks
+        // up a web page's accessibility tree, which can take tens of milliseconds); `userSubmittedViaEnter` is looked at again below,
+        // because Enter can arrive while it runs.
+        var focusStatusAtDelivery: FocusedTextInputStatus? = nil
+        if !isTypingInsideOwnApp && !userSubmittedViaEnter {
+            focusStatusAtDelivery = await Task.detached(priority: .userInitiated) {
+                ContextInjector.focusedTextInputStatus(tracePhase: "deliver")
+            }.value
+        }
+
         var landedInInput = true
         if userSubmittedViaEnter {
             // User already hit Enter and sent the message during polishing — do NOT re-paste a ghost copy!
@@ -1273,17 +1292,24 @@ public final class AppState: ObservableObject {
             landedInInput = true
         } else if isTypingInsideOwnApp {
             sandboxText = sandboxBaseBeforeSession + finalText
-        } else if didStreamViaSSE {
-            liveInputSession?.finishSSEPolishStream(with: finalText)
-            landedInInput = true
-        } else if llmConfig.enableLiveInlineTyping && activeMode == .dictate {
-            landedInInput = liveInputSession?.finalizeAfterKeyRelease(with: finalText) ?? false
         } else {
-            if ContextInjector.isLikelyEditableFocusNow() || activeContext.hasFocusedTextInput {
-                ContextInjector.injectTextAtCursor(finalText, in: activeContext)
-            } else {
-                ContextInjector.saveToSafetyClipboard(finalText)
+            // Without a text input to take it, nothing is typed or pasted and the clipboard is left alone: the text is offered on
+            // the Copy pill instead.
+            let focusStatus = focusStatusAtDelivery ?? .unknown
+            let plan = DictationDelivery.plan(
+                status: focusStatus,
+                accessibilityTrusted: ContextInjector.isAccessibilityTrusted(),
+                targetAllowed: ContextInjector.isAllowedTarget(bundleID: activeContext.bundleID, appName: activeContext.appName)
+            )
+            if case .offerCopy(let reason) = plan {
+                ContextInjector.appendInjectionTrace("finalize app=\(activeContext.bundleID) branch=\(reason.traceBranch) emitted=\(liveInputSession?.currentText.count ?? 0) final=\(finalText.count)")
                 landedInInput = false
+            } else if didStreamViaSSE {
+                liveInputSession?.finishSSEPolishStream(with: finalText)
+            } else if llmConfig.enableLiveInlineTyping && activeMode == .dictate {
+                landedInInput = liveInputSession?.finalizeAfterKeyRelease(with: finalText, focusStatus: focusStatus) ?? false
+            } else {
+                ContextInjector.injectTextAtCursor(finalText, in: activeContext)
             }
         }
 
@@ -1317,9 +1343,7 @@ public final class AppState: ObservableObject {
         liveInputSession = nil
 
         if !landedInInput {
-            // P4 Safety Vault triggered: user wasn't focused inside an input field!
-            phase = .savedToClipboard(textPreview: "Copied · Cmd+V to paste")
-            scheduleIdleReset(after: 2.6)
+            showCopyPill(for: finalText)
         } else {
             phase = .completed(finalText: finalText, latencyMs: polishMs)
             scheduleIdleReset(after: 0.35)
@@ -1365,6 +1389,36 @@ public final class AppState: ObservableObject {
         phase = .error(message: failure.pillText)
         statusBanner = failure.bannerText
         scheduleIdleReset(after: DictationFailure.displaySeconds)
+    }
+
+    // MARK: Copy pill
+
+    /// The cleaned text had nowhere to go (no text input in focus): offers it on the pill instead of typing it or touching the
+    /// clipboard. The pill hides after `CopyPillCountdown.visibleSeconds` unless Copy is clicked; hovering it pauses that countdown.
+    private func showCopyPill(for text: String) {
+        copyCountdown.start(now: Date())
+        phase = .readyToCopy(text: text)
+        scheduleIdleReset(after: copyCountdown.remaining)
+    }
+
+    /// The pill's Copy button: the full text goes on the general pasteboard as plain text, the pill says "Copied" for a second, then hides.
+    public func copyReadyText() {
+        guard case .readyToCopy(let text) = phase else { return }
+        ContextInjector.copyPlainText(text)
+        phase = .copied
+        scheduleIdleReset(after: CopyPillCountdown.copiedSeconds)
+    }
+
+    /// The pointer entered or left the Copy pill (reported by the pill window's tracking area).
+    public func copyPillHoverChanged(_ isHovering: Bool) {
+        guard case .readyToCopy = phase else { return }
+        if isHovering, copyCountdown.isRunning {
+            copyCountdown.pause(now: Date())
+            idleResetTask?.cancel()
+        } else if !isHovering, !copyCountdown.isRunning {
+            copyCountdown.resume(now: Date())
+            scheduleIdleReset(after: copyCountdown.remaining)
+        }
     }
 
     /// Returns the pill to idle after `seconds`. Only the latest call counts: an earlier timer must not cut a newer

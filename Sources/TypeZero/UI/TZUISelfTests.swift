@@ -240,8 +240,99 @@ enum TZUISelfTests {
             } else {
                 expect(false, "the Thinking pill could be drawn offscreen")
             }
+
+            // 13. Copy pill (one-line preview + Copy button) and its "Copied" confirmation
+            let copySamples = [
+                "Can you move the standup to 3 pm tomorrow?",
+                Array(repeating: "A much longer dictation that cannot possibly fit on one line of the pill.", count: 6).joined(separator: " "),
+                "First line\nSecond line",
+                String(repeating: "你好世界", count: 60),
+                "ok"
+            ]
+            let copyCaptures = copySamples.compactMap { sample in TZPillRender.capture { FloatingPillCopyView(text: sample) } }
+            let copiedCapture = TZPillRender.capture { FloatingPillCopiedView() }
+            expect(
+                copyCaptures.count == copySamples.count
+                    && copyCaptures.allSatisfy { !$0.ink.isNull && $0.ink.minX >= 3 && $0.ink.maxX <= panel.width - 3 && $0.ink.minY >= 6 && $0.ink.maxY <= panel.height - 6 },
+                "the Copy pill is drawn inside the 224 x 58 pt panel, with margins, for a short, a long, a two-line, a CJK and a one-word text (nothing clipped)"
+            )
+            if copyCaptures.count == copySamples.count, let copiedCapture {
+                expect(
+                    copyCaptures[1].ink.width >= 190 && copyCaptures[1].ink.width <= FloatingPillLayout.copyMaxWidth + 2
+                        && copyCaptures[3].ink.width >= 190 && copyCaptures[3].ink.width <= FloatingPillLayout.copyMaxWidth + 2
+                        && copyCaptures[0].ink.width < copyCaptures[1].ink.width && copyCaptures[4].ink.width < copyCaptures[0].ink.width,
+                    "the Copy pill hugs a short preview, and a long text is cut with an ellipsis at the pill's full width (about 216 pt) instead of growing"
+                )
+                expect(
+                    copyCaptures.allSatisfy { $0.ink.height >= 28 && $0.ink.height <= 36 },
+                    "the Copy pill is one line high (about 32 pt) whatever the text: a two-line text is shown as one line"
+                )
+                let sameAgain = TZPillRender.capture { FloatingPillCopyView(text: copySamples[0]) }
+                expect(
+                    sameAgain?.pixels == copyCaptures[0].pixels && copyCaptures[0].pixels != copyCaptures[1].pixels && copyCaptures[0].pixels != copyCaptures[4].pixels,
+                    "the Copy pill draws its text: different texts give different pictures, the same text the same one"
+                )
+                expect(
+                    !copiedCapture.ink.isNull && copiedCapture.ink.minX >= 3 && copiedCapture.ink.maxX <= panel.width - 3 && copiedCapture.ink.minY >= 6 && copiedCapture.ink.maxY <= panel.height - 6
+                        && copiedCapture.ink.width >= 70 && copiedCapture.ink.width <= 130 && copiedCapture.ink.height >= 28 && copiedCapture.ink.height <= 36
+                        && copiedCapture.pixels != copyCaptures[4].pixels,
+                    "the Copied pill (check mark and 'Copied') is a small capsule inside the panel, clearly different from the Copy pill"
+                )
+            } else {
+                expect(false, "the Copy pill and the Copied pill could be drawn offscreen")
+            }
+            expect(
+                FloatingPillLayout.copyMaxWidth <= panel.width - 8 && FloatingPillLayout.copyHeight <= panel.height - 12,
+                "Copy pill layout: at most the panel width minus a 4 pt margin on each side, and it fits the 58 pt panel height with room to spare"
+            )
+
+            // 14. The pill window: it must not take focus from the app in front, and only the Copy pill takes clicks
+            let windowFlags = MainActor.assumeIsolated { () -> (nonActivating: Bool, canBecomeKey: Bool, canBecomeMain: Bool, clickThrough: Bool, floating: Bool) in
+                let pillPanel = FloatingPillController.makePanel(contentView: NSView(), size: panel)
+                return (pillPanel.styleMask.contains(.nonactivatingPanel), pillPanel.canBecomeKey, pillPanel.canBecomeMain, pillPanel.ignoresMouseEvents, pillPanel.isFloatingPanel)
+            }
+            expect(
+                windowFlags.nonActivating && !windowFlags.canBecomeKey && !windowFlags.canBecomeMain && windowFlags.floating,
+                "the pill window is a non-activating panel that cannot become key or main, so clicking Copy leaves the app in front in focus"
+            )
+            expect(
+                windowFlags.clickThrough,
+                "the pill window starts click-through; it takes mouse events only while the Copy pill is showing"
+            )
+            let hostingChecks = MainActor.assumeIsolated { () -> (firstMouse: Bool, trackingAreas: Int) in
+                let host = FloatingPillHostingView(rootView: Color.clear)
+                host.frame = NSRect(origin: .zero, size: panel)
+                host.updateTrackingAreas()
+                host.updateTrackingAreas()
+                let ours = host.trackingAreas.filter { $0.options.contains(.activeAlways) && $0.options.contains(.mouseEnteredAndExited) }
+                return (host.acceptsFirstMouse(for: nil), ours.count)
+            }
+            expect(
+                hostingChecks.firstMouse && hostingChecks.trackingAreas == 1,
+                "the pill's hosting view accepts the first click (the app is never active) and keeps exactly one always-active hover tracking area"
+            )
+
+            // 15. Copy puts the full text on the pasteboard as plain text (a private pasteboard: the real clipboard is not touched)
+            let scratch = NSPasteboard(name: NSPasteboard.Name("io.github.typezero.selftest.\(UUID().uuidString)"))
+            defer { scratch.releaseGlobally() }
+            scratch.clearContents()
+            scratch.setString("old clipboard", forType: .string)
+            scratch.setData(Data([1, 2, 3]), forType: .rtf)
+            let fullText = (copySamples[1] + "\nSecond paragraph, with “quotes” and 你好.")
+            let copyWorked = ContextInjector.copyPlainText(fullText, to: scratch)
+            // macOS adds the legacy NSStringPboardType next to public.utf8-plain-text on its own; nothing richer (rtf, html ...) may remain.
+            let copiedTypes = Set((scratch.types ?? []).map(\.rawValue))
+            expect(
+                copyWorked && scratch.string(forType: .string) == fullText && fullText.count > CopyPill.previewCharacterLimit
+                    && copiedTypes.contains("public.utf8-plain-text") && copiedTypes.isSubset(of: ["public.utf8-plain-text", "NSStringPboardType"]),
+                "Copy puts the full text (not the preview) on the pasteboard as plain text only, replacing what was there"
+            )
+            expect(
+                !ContextInjector.copyPlainText("", to: scratch) && scratch.string(forType: .string) == fullText,
+                "Copy of an empty text leaves the pasteboard alone"
+            )
         } else {
-            print("  - SKIP: no window-server session, so the floating pill's error and Thinking capsules were not drawn offscreen")
+            print("  - SKIP: no window-server session, so the floating pill's error, Thinking and Copy capsules were not drawn offscreen")
         }
 
         print("==> UI summary: \(passed) passed, \(failed) failed.")

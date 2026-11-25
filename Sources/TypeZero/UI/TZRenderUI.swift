@@ -171,7 +171,7 @@ enum TZRenderUI {
         // Sidebar engine card for other configurations.
         renderer.enginesVariants(base: "engines-variants")
 
-        // Floating pill capsules (Thinking and the error states) at the pill window's real size.
+        // Floating pill capsules (Thinking, the error states, the Copy pill and "Copied") at the pill window's real size.
         renderer.pillVariants(base: "pill-states")
 
         // The brand mark at the sizes it is drawn at, and the menu bar icon on a light and a dark menu bar.
@@ -334,11 +334,12 @@ enum TZRenderUI {
             write(view, size: CGSize(width: 1000, height: 220), name: base)
         }
 
-        /// The floating pill's Thinking and error capsules, each inside the pill window's real 224 x 58 pt frame (dashed outline)
+        /// The floating pill's Thinking, error, Copy and Copied capsules, each inside the pill window's real 224 x 58 pt frame (dashed outline)
         /// over a grey backdrop, so clipping against the panel edges is visible.
         func pillVariants(base: String) {
             let panel = FloatingPillLayout.panelSize
             let overlong = Array(repeating: "This reason is much too long to fit in the pill.", count: 4).joined(separator: " ")
+            let longDictation = Array(repeating: "I wanted to follow up on the proposal we discussed last week and ask whether the revised numbers work for your team.", count: 2).joined(separator: " ")
             let cloudFailure = DictationFailure.engineError("Cloud speech recognition failed: HTTP 401: Incorrect API key provided: gsk_abc123. Check the key.")
             let cells: [(String, AnyView)] = [
                 ("Thinking", AnyView(FloatingPillThinkingView())),
@@ -348,7 +349,11 @@ enum TZRenderUI {
                 ("Cloud error (shortened)", AnyView(FloatingPillErrorView(message: cloudFailure.pillText))),
                 ("No speech", AnyView(FloatingPillErrorView(message: DictationFailure.noSpeechPillText))),
                 ("Over-long text (cut at 2 lines)", AnyView(FloatingPillErrorView(message: overlong))),
-                ("Icon only (empty message)", AnyView(FloatingPillErrorView(message: "")))
+                ("Icon only (empty message)", AnyView(FloatingPillErrorView(message: ""))),
+                ("Copy pill (short text)", AnyView(FloatingPillCopyView(text: "Can you move the standup to 3 pm?"))),
+                ("Copy pill (long text, cut)", AnyView(FloatingPillCopyView(text: longDictation))),
+                ("Copy pill (two lines, one shown)", AnyView(FloatingPillCopyView(text: "Agenda for Monday\n1. Budget review\n2. Hiring"))),
+                ("Copied (after the click)", AnyView(FloatingPillCopiedView()))
             ]
             let columns = 4
             let rows = (cells.count + columns - 1) / columns

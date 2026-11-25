@@ -38,8 +38,63 @@ public enum PipelinePhase: Equatable {
     case listening(livePreview: String, mode: DictationMode)
     case polishing(rawText: String)
     case completed(finalText: String, latencyMs: Int)
-    case savedToClipboard(textPreview: String)
+    /// The cleaned text had nowhere to go (no text field has focus). The pill shows a one-line preview and a Copy button; the full
+    /// text waits here, and nothing is written to the clipboard until the button is clicked.
+    case readyToCopy(text: String)
+    /// The Copy button was clicked: the pill says "Copied" for a moment, then hides.
+    case copied
     case error(message: String)
+}
+
+/// The Copy pill (see `PipelinePhase.readyToCopy`): what it previews and how long it stays up.
+public enum CopyPill {
+    /// Longest preview, in characters. The pill cuts what does not fit its width on top of this (and a very long dictation never
+    /// reaches the layout engine in full).
+    public static let previewCharacterLimit = 80
+
+    /// One line for the pill: every run of whitespace, line breaks included, becomes a single space; longer than
+    /// `previewCharacterLimit` is cut and ended with an ellipsis.
+    public static func preview(of text: String, limit: Int = previewCharacterLimit) -> String {
+        let oneLine = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard oneLine.count > limit else { return oneLine }
+        return String(oneLine.prefix(max(1, limit - 1))).trimmingCharacters(in: .whitespaces) + "…"
+    }
+}
+
+/// How long the Copy pill waits for a click: 8 s, paused while the pointer is over it. The caller supplies the clock, so the timing can
+/// be tested without waiting.
+public struct CopyPillCountdown: Equatable {
+    /// Seconds the pill stays up when nobody clicks.
+    public static let visibleSeconds: Double = 8
+    /// Seconds the "Copied" confirmation stays up.
+    public static let copiedSeconds: Double = 1
+
+    /// Seconds left as of the last `start` / `pause`.
+    public private(set) var remaining: Double = CopyPillCountdown.visibleSeconds
+    private var runningSince: Date?
+
+    public init() {}
+
+    public var isRunning: Bool { runningSince != nil }
+
+    /// Begins a fresh countdown of `visibleSeconds`.
+    public mutating func start(now: Date) {
+        remaining = Self.visibleSeconds
+        runningSince = now
+    }
+
+    /// Stops the clock (the pointer is over the pill), keeping what was left.
+    public mutating func pause(now: Date) {
+        guard let since = runningSince else { return }
+        remaining = max(0, remaining - now.timeIntervalSince(since))
+        runningSince = nil
+    }
+
+    /// Continues from what `pause` kept.
+    public mutating func resume(now: Date) {
+        guard runningSince == nil else { return }
+        runningSince = now
+    }
 }
 
 /// Why a dictation could not start or had to stop, worded for two places.

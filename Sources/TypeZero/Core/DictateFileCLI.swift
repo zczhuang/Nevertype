@@ -19,13 +19,13 @@ public enum DictateFileCLI {
         var context: ActiveScreenContext {
             switch self {
             case .chat:
-                return ActiveScreenContext(appName: "Slack", bundleID: "com.tinyspeck.slackmacgap", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true)
+                return ActiveScreenContext(appName: "Slack", bundleID: "com.tinyspeck.slackmacgap", windowTitle: "", selectedText: "", precedingText: "")
             case .email:
-                return ActiveScreenContext(appName: "Mail", bundleID: "com.apple.mail", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true)
+                return ActiveScreenContext(appName: "Mail", bundleID: "com.apple.mail", windowTitle: "", selectedText: "", precedingText: "")
             case .notes:
-                return ActiveScreenContext(appName: "Notes", bundleID: "com.apple.Notes", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true)
+                return ActiveScreenContext(appName: "Notes", bundleID: "com.apple.Notes", windowTitle: "", selectedText: "", precedingText: "")
             case .terminal:
-                return ActiveScreenContext(appName: "Terminal", bundleID: "com.apple.Terminal", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true)
+                return ActiveScreenContext(appName: "Terminal", bundleID: "com.apple.Terminal", windowTitle: "", selectedText: "", precedingText: "")
             }
         }
     }

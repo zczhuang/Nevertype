@@ -96,7 +96,7 @@ public enum SelfTestSuite {
         // 4. Deterministic Pangu Spacing, Full-Width Chinese Punctuation & Percentage ITN
         let formatted = PolishEngine.applyPostFormattingRules(
             "使用DeepSeek提升百分之35速度。",
-            context: ActiveScreenContext(appName: "Slack", bundleID: "com.tinyspeck.slackmacgap", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true),
+            context: ActiveScreenContext(appName: "Slack", bundleID: "com.tinyspeck.slackmacgap", windowTitle: "", selectedText: "", precedingText: ""),
             config: .default
         )
         expect(
@@ -105,7 +105,7 @@ public enum SelfTestSuite {
         )
         let normQ = PolishEngine.applyPostFormattingRules(
             "今天发财报会不会一样? 太好了!",
-            context: ActiveScreenContext(appName: "微信", bundleID: "com.tencent.xinwechat", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true),
+            context: ActiveScreenContext(appName: "微信", bundleID: "com.tencent.xinwechat", windowTitle: "", selectedText: "", precedingText: ""),
             config: .default
         )
         expect(
@@ -123,7 +123,7 @@ public enum SelfTestSuite {
         )
         let strippedMd = PolishEngine.applyPostFormattingRules(
             "### 核心结论\n这是**重点内容**，请确认。",
-            context: ActiveScreenContext(appName: "微信", bundleID: "com.tencent.xinwechat", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true),
+            context: ActiveScreenContext(appName: "微信", bundleID: "com.tencent.xinwechat", windowTitle: "", selectedText: "", precedingText: ""),
             config: .default
         )
         expect(
@@ -425,8 +425,8 @@ public enum SelfTestSuite {
         )
 
         // 13. Zero-Rewind Atomic Polish Routing (WeChat/QQ & Long Drafts >= 25 Chars) + Prefix-Preserving Replacement Diff
-        let wechatCtx = ActiveScreenContext(appName: "微信", bundleID: "com.tencent.xinwechat", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true)
-        let notesCtx = ActiveScreenContext(appName: "Notes", bundleID: "com.apple.Notes", windowTitle: "", selectedText: "", precedingText: "", hasFocusedTextInput: true)
+        let wechatCtx = ActiveScreenContext(appName: "微信", bundleID: "com.tencent.xinwechat", windowTitle: "", selectedText: "", precedingText: "")
+        let notesCtx = ActiveScreenContext(appName: "Notes", bundleID: "com.apple.Notes", windowTitle: "", selectedText: "", precedingText: "")
         let longDraft = "似乎我在微信里面发不是特别容易回行比如现在我说很长的字我在看一个巴黎视频第一他有真人出镜感第二讲解很轻快"
         expect(
             wechatCtx.prefersAtomicPolishReplacement
@@ -1405,6 +1405,375 @@ public enum SelfTestSuite {
                 "Apple Speech fallback failure: a short pill (download a speech model in Settings) plus a full explanation, carried through the engine error path"
             )
         }
+
+        // 72. Focus check: the three-way classification of the focused element. The Accessibility read is separate from these rules,
+        // so everything here runs on plain values, without any app in focus.
+        func focus(
+            _ role: String?, subrole: String? = nil, app: String = "com.example.editor",
+            range: Bool = false, value: Bool = false, noFocus: Bool = false, host: String? = nil,
+            web: Bool = false, electron: Bool = false
+        ) -> FocusedTextInputStatus {
+            FocusedTextInputClassifier.classify(FocusedElementFacts(
+                bundleID: app, noFocusedElement: noFocus, role: role, subrole: subrole,
+                selectedTextRangeSettable: range, valueSettable: value, webAreaHost: host,
+                isWebContent: web, isElectronApp: electron
+            ))
+        }
+        let textRoles = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+        expect(
+            Set(textRoles) == FocusedTextInputClassifier.textInputRoles
+                && textRoles.allSatisfy { focus($0) == .editable }
+                && focus("AXTextField", subrole: "AXSearchField") == .editable
+                && focus("AXTextField", subrole: "AXSecureTextField") == .editable
+                && focus("AXGroup", subrole: "AXSearchField") == .editable,
+            "Focus check: text field, text area, combo box and search field (also by subrole) are editable"
+        )
+        let nonTextRoles = [
+            "AXDesktop", "AXButton", "AXImage", "AXToolbar", "AXList", "AXOutline", "AXTable", "AXRow", "AXCell", "AXBrowser",
+            "AXStaticText", "AXLink", "AXCheckBox", "AXRadioButton", "AXSlider", "AXPopUpButton", "AXMenuButton", "AXTabGroup", "AXMenuItem"
+        ]
+        expect(
+            nonTextRoles.count == 19
+                && Set(nonTextRoles) == FocusedTextInputClassifier.nonTextRoles
+                && nonTextRoles.allSatisfy { focus($0) == .notEditable },
+            "Focus check: the desktop and every clear non-text control (button, list, table, link, slider, menu item ...) are not editable"
+        )
+        expect(
+            ["AXWindow", "AXApplication", "AXGroup", "AXScrollArea", "AXSplitGroup", "AXSomethingNew", ""].allSatisfy { focus($0) == .unknown }
+                && focus(nil) == .unknown
+                && focus(nil, noFocus: true) == .unknown
+                && focus(nil, app: "com.tinyspeck.slackmacgap") == .unknown
+                && focus("AXGroup", app: "com.hnc.Discord") == .unknown
+                && focus("AXWindow", app: "com.microsoft.VSCode") == .unknown,
+            "Focus check: a window, application, group, scroll area, an unfamiliar role, no focused element or a failed read stay unknown (Electron and Qt apps keep typing)"
+        )
+        expect(
+            focus("AXGroup", range: true) == .editable
+                && focus("AXScrollArea", range: true) == .editable
+                && focus("AXGroup", value: true) == .editable
+                && focus("AXWindow", range: true, value: true) == .editable
+                && focus("AXGroup") == .unknown,
+            "Focus check: any other element whose selected-text range or value is settable counts as editable"
+        )
+        expect(
+            focus("AXSlider", value: true) == .notEditable
+                && focus("AXCheckBox", value: true) == .notEditable
+                && focus("AXPopUpButton", value: true) == .notEditable
+                && focus("AXLink", range: true) == .notEditable
+                && focus("AXStaticText", range: true, value: true) == .notEditable,
+            "Focus check: a clear non-text control stays not editable even when its value is settable (sliders, check boxes and pop-up buttons have one)"
+        )
+        // Spreadsheets: a selected cell reports AXCell (or its row / table) and typing starts a cell edit, so dictation keeps typing there
+        let numbers = "com.apple.iWork.Numbers", excel = "com.microsoft.Excel", libreOffice = "org.libreoffice.script"
+        expect(
+            focus("AXCell", app: numbers) == .unknown
+                && focus("AXCell", app: excel) == .unknown
+                && focus("AXTable", app: libreOffice) == .unknown
+                && focus("AXRow", app: numbers) == .unknown
+                && focus("AXTable", app: excel) == .unknown
+                && focus("AXRow", app: libreOffice) == .unknown
+                && focus("AXCell", app: "com.APPLE.iwork.numbers") == .unknown
+                && [numbers, excel, libreOffice].allSatisfy { FocusedTextInputClassifier.isSpreadsheet(bundleID: $0) },
+            "Focus check: a selected cell (or its row or table) in Numbers, Excel and LibreOffice stays unknown, so dictation types into it as before"
+        )
+        expect(
+            focus("AXCell", app: "com.apple.mail") == .notEditable
+                && focus("AXTable", app: "com.apple.Music") == .notEditable
+                && focus("AXRow", app: "com.apple.mail") == .notEditable
+                && focus("AXCell", app: "com.example.editor") == .notEditable
+                && focus("AXCell", app: "com.apple.finder") == .notEditable
+                && !["com.apple.mail", "com.apple.Music", "com.apple.finder", "com.apple.iWork.Pages", "com.apple.iWork.Keynote"]
+                    .contains { FocusedTextInputClassifier.isSpreadsheet(bundleID: $0) },
+            "Focus check: a cell in Mail's message list, a table in Music's library and cells anywhere else that is not a spreadsheet stay not editable"
+        )
+        expect(
+            focus("AXButton", app: numbers) == .notEditable
+                && focus("AXList", app: excel) == .notEditable
+                && focus("AXOutline", app: numbers) == .notEditable
+                && focus("AXStaticText", app: libreOffice) == .notEditable
+                && focus("AXToolbar", app: excel) == .notEditable
+                && focus("AXTextField", app: excel) == .editable
+                && focus("AXTextArea", app: numbers) == .editable
+                && FocusedTextInputClassifier.spreadsheetCellRoles == ["AXCell", "AXRow", "AXTable"],
+            "Focus check: in a spreadsheet only the cell, row and table roles are exempt; buttons, lists and the like stay not editable, and its text fields stay editable"
+        )
+        let finder = "com.apple.finder"
+        expect(
+            focus("AXTextField", app: finder) == .editable
+                && focus("AXTextField", subrole: "AXSearchField", app: finder) == .editable
+                && focus("AXList", app: finder) == .notEditable
+                && focus("AXOutline", app: finder) == .notEditable
+                && focus("AXDesktop", app: finder) == .notEditable
+                && focus("AXScrollArea", app: finder) == .notEditable
+                && focus("AXWindow", app: finder) == .notEditable
+                && focus(nil, app: finder, noFocus: true) == .notEditable
+                && focus("AXScrollArea", app: finder, range: true) == .editable,
+            "Focus check: Finder's rename and search fields are editable; its file list, the desktop and everything else in Finder are not"
+        )
+        expect(
+            focus(nil, app: finder) == .unknown && focus("AXList", app: "com.apple.dt.Xcode") == .notEditable,
+            "Focus check: a failed Accessibility read in Finder stays unknown (a timeout must not hide a rename field)"
+        )
+        expect(
+            ["com.apple.Safari", "com.google.Chrome", "com.brave.Browser", "company.thebrowser.Browser", "com.microsoft.edgemac"]
+                .allSatisfy { focus("AXWebArea", app: $0, host: "example.com") == .notEditable && FocusedTextInputClassifier.isWebBrowser(bundleID: $0) },
+            "Focus check: a web page with nothing focused (the web area itself in focus) is not editable in Safari and Chromium browsers"
+        )
+        expect(
+            ["com.apple.mail", "org.mozilla.firefox", "com.example.webview"]
+                .allSatisfy { focus("AXWebArea", app: $0, host: "example.com") == .unknown && !FocusedTextInputClassifier.isWebBrowser(bundleID: $0) },
+            "Focus check: a web area in Mail and other web views that are neither a browser nor Electron stays unknown, because an editable page (Mail compose) also reports its web area as focused"
+        )
+        expect(
+            focus("AXWebArea", app: "com.google.Chrome") == .unknown
+                && focus("AXWebArea", app: "com.apple.Safari", host: nil) == .unknown
+                && focus("AXWebArea", app: "com.google.Chrome", host: "docs.google.com") == .unknown
+                && focus("AXWebArea", app: "com.google.Chrome", host: "DOCS.google.com") == .unknown
+                && focus("AXWebArea", app: "com.apple.Safari", host: "docs.google.com") == .unknown
+                && focus("AXWebArea", app: "com.google.Chrome", host: "mail.google.com") == .notEditable
+                && focus("AXWebArea", app: "com.google.Chrome", host: "notdocs.google.com.evil.example") == .notEditable
+                && FocusedTextInputClassifier.isHiddenInputWebHost("docs.google.com")
+                && FocusedTextInputClassifier.isHiddenInputWebHost("a.docs.google.com")
+                && !FocusedTextInputClassifier.isHiddenInputWebHost("google.com")
+                && !FocusedTextInputClassifier.isHiddenInputWebHost(nil),
+            "Focus check: a browser's web area is only called not editable once the page's address was read, and Google Docs, Sheets and Slides stay unknown (their hidden typing frame is unverified)"
+        )
+        expect(
+            focus("AXTextArea", app: "com.google.Chrome") == .editable
+                && focus("AXTextArea", app: "com.google.Chrome", host: "docs.google.com") == .editable
+                && focus("AXGroup", app: "com.google.Chrome") == .unknown
+                && focus("AXWebArea", app: "com.google.Chrome", range: true) == .editable
+                && focus("AXWebArea", app: "com.apple.Safari", value: true) == .editable
+                && focus("AXLink", app: "com.google.Chrome") == .notEditable,
+            "Focus check: a contenteditable editor (Gmail compose) reports AXTextArea, never the web area, and an editable web area is editable"
+        )
+        // Web content in an Electron app or a browser. Real-world case: dictating in the Claude desktop app with the focus on the
+        // conversation, not the message box, traced as a plain AXGroup (and was typed into nothing).
+        let claude = "com.anthropic.claudefordesktop"
+        let slack = "com.tinyspeck.slackmacgap", discord = "com.hnc.Discord", vsCode = "com.microsoft.VSCode"
+        expect(
+            focus("AXGroup", app: claude, web: true, electron: true) == .notEditable
+                && focus("AXGroup", app: claude, host: "claude.ai", web: true, electron: true) == .notEditable
+                && [slack, discord, vsCode, "notion.id", "md.obsidian"].allSatisfy { focus("AXGroup", app: $0, web: true, electron: true) == .notEditable }
+                && focus("AXWebArea", app: claude, electron: true) == .notEditable
+                && focus("AXScrollArea", app: claude, web: true, electron: true) == .notEditable
+                && focus("AXHeading", app: claude, web: true, electron: true) == .notEditable,
+            "Focus check: an Electron app with the focus on page content that is not a text input (the conversation in the Claude desktop app, an empty page) is not editable"
+        )
+        expect(
+            focus("AXTextArea", app: claude, web: true, electron: true) == .editable
+                && focus("AXTextField", app: slack, web: true, electron: true) == .editable
+                && focus("AXGroup", app: claude, range: true, web: true, electron: true) == .editable
+                && focus("AXGroup", app: discord, value: true, web: true, electron: true) == .editable
+                && focus("AXTextArea", app: claude, host: "docs.google.com", web: true, electron: true) == .editable,
+            "Focus check: Electron's contenteditable editors (the Claude message box, Slack, Discord, Notion) stay editable: they report a text role or a settable selected range"
+        )
+        expect(
+            focus("AXWindow", app: claude, electron: true) == .unknown
+                && focus("AXWindow", app: claude, web: true, electron: true) == .unknown
+                && focus("AXApplication", app: claude, web: true, electron: true) == .unknown
+                && focus(nil, app: claude, electron: true) == .unknown
+                && focus(nil, app: claude, noFocus: true, electron: true) == .unknown
+                && focus("AXGroup", app: claude, electron: true) == .unknown
+                && focus("AXGroup", app: claude, host: "docs.google.com", web: true, electron: true) == .unknown
+                && focus("AXGroup", app: claude, host: "a.docs.google.com", web: true, electron: true) == .unknown,
+            "Focus check: in an Electron app a window, the application, no focused element, a failed read, a group outside web content and Google Docs stay unknown"
+        )
+        expect(
+            focus("AXGroup", app: "com.google.Chrome", host: "example.com", web: true) == .notEditable
+                && focus("AXGroup", app: "com.apple.Safari", host: "example.com", web: true) == .notEditable
+                && focus("AXGroup", app: "com.google.Chrome", host: "docs.google.com", web: true) == .unknown
+                && focus("AXGroup", app: "com.google.Chrome", web: true) == .unknown
+                && focus("AXGroup", app: "com.google.Chrome", range: true, host: "example.com", web: true) == .editable
+                && focus("AXTextArea", app: "com.google.Chrome", host: "example.com", web: true) == .editable
+                && focus("AXWindow", app: "com.google.Chrome", host: "example.com", web: true) == .unknown
+                && focus("AXGroup", app: "com.google.Chrome", host: "example.com") == .unknown,
+            "Focus check: in a browser, page content that is not a text input is not editable once the page's address was read; Google Docs, an unreadable address and a group outside the page stay unknown"
+        )
+        expect(
+            ["com.mitchellh.ghostty", "org.alacritty", "net.kovidgoyal.kitty", "com.github.wez.wezterm", "com.googlecode.iterm2", "com.apple.Terminal"]
+                .allSatisfy { focus("AXGroup", app: $0) == .unknown && focus("AXGroup", app: $0, host: "example.com") == .unknown }
+                && focus("AXGroup", app: "com.apple.mail", web: true) == .unknown
+                && focus("AXGroup", app: "com.apple.mail", host: "example.com", web: true) == .unknown
+                && focus("AXWebArea", app: "com.apple.mail", host: "example.com") == .unknown
+                && focus("AXGroup", app: "com.example.tauri", web: true) == .unknown,
+            "Focus check: native apps with a plain group in focus (terminals) and web content in apps that are neither a browser nor Electron (Mail, other web views) stay unknown"
+        )
+        expect(
+            FocusedTextInputClassifier.isDecisive(role: "AXTextArea", subrole: nil)
+                && FocusedTextInputClassifier.isDecisive(role: "AXSlider", subrole: nil)
+                && FocusedTextInputClassifier.isDecisive(role: "AXGroup", subrole: "AXSearchField")
+                && !FocusedTextInputClassifier.isDecisive(role: "AXGroup", subrole: nil)
+                && !FocusedTextInputClassifier.isDecisive(role: "AXWebArea", subrole: nil)
+                && !FocusedTextInputClassifier.isDecisive(role: nil, subrole: nil),
+            "Focus check: the settable reads are only needed when the role does not settle the answer"
+        )
+        let traceLine = FocusedElementFacts(bundleID: "com.apple.Safari", role: "AXWebArea", subrole: nil, webAreaHost: "example.com").traceDescription(status: .notEditable)
+        expect(
+            traceLine == "app=com.apple.Safari role=AXWebArea subrole=none noFocus=0 rangeSettable=0 valueSettable=0 web=1 electron=0 page=plain status=notEditable"
+                && !traceLine.contains("\n") && !traceLine.contains("example")
+                && FocusedElementFacts(bundleID: "x", role: "AXTextField", subrole: "AXSearchField").traceDescription(status: .editable)
+                    == "app=x role=AXTextField subrole=AXSearchField noFocus=0 rangeSettable=0 valueSettable=0 web=0 electron=0 status=editable"
+                && FocusedElementFacts(bundleID: claude, role: "AXGroup", isWebContent: true, isElectronApp: true).traceDescription(status: .notEditable)
+                    == "app=com.anthropic.claudefordesktop role=AXGroup subrole=none noFocus=0 rangeSettable=0 valueSettable=0 web=1 electron=1 page=unreadable status=notEditable"
+                && FocusedElementFacts(bundleID: "x", role: "AXWebArea", webAreaHost: "docs.google.com").traceDescription(status: .unknown).contains("page=webEditor")
+                && !FocusedElementFacts(bundleID: "x", role: "AXWebArea", webAreaHost: "docs.google.com").traceDescription(status: .unknown).contains("google")
+                && FocusedElementFacts(bundleID: "x", role: "AXWebArea").traceDescription(status: .unknown).contains("page=unreadable"),
+            "Focus check: the injection trace line carries the app, role, subrole, web / Electron flags and result, on one line, with no field text and no page address"
+        )
+        expect(
+            ActiveScreenContext.empty.focusStatus == .unknown
+                && ActiveScreenContext(appName: "Notes", bundleID: "com.apple.Notes", windowTitle: "", selectedText: "", precedingText: "").focusStatus == .unknown
+                && ActiveScreenContext(appName: "Finder", bundleID: finder, windowTitle: "", selectedText: "", precedingText: "", focusStatus: .notEditable).focusStatus == .notEditable,
+            "Focus check: a context nobody checked is unknown, and carries the result when one was taken"
+        )
+
+        // Web content lookup: the walk up the accessibility parents (pure; the real read plugs AXUIElement into it) ...
+        func climb(_ start: Int, parents: [Int: Int], roles: [Int: String], maxLevels: Int = WebContentWalk.maxLevels, stopAfterSteps: Int? = nil) -> WebContentWalk.Outcome<Int> {
+            var steps = 0
+            return WebContentWalk.enclosingWebArea(
+                of: start, maxLevels: maxLevels,
+                parent: { parents[$0] }, role: { roles[$0] },
+                shouldStop: { steps += 1; return stopAfterSteps.map { steps > $0 } ?? false }
+            )
+        }
+        let chain = Dictionary(uniqueKeysWithValues: (1...30).map { ($0, $0 + 1) })              // 1 -> 2 -> 3 ... -> 31
+        func chainRoles(webAreaAt: Int? = nil, windowAt: Int? = nil) -> [Int: String] {
+            var roles = Dictionary(uniqueKeysWithValues: (2...31).map { ($0, "AXGroup") })
+            if let webAreaAt { roles[webAreaAt] = "AXWebArea" }
+            if let windowAt { roles[windowAt] = "AXWindow" }
+            return roles
+        }
+        expect(
+            climb(1, parents: chain, roles: chainRoles(webAreaAt: 4)) == .webArea(4)
+                && climb(1, parents: chain, roles: chainRoles(webAreaAt: 2)) == .webArea(2)
+                && climb(1, parents: chain, roles: chainRoles(webAreaAt: 16)) == .webArea(16)
+                && WebContentWalk.maxLevels == 15,
+            "Web content walk: finds the web area up to 15 parents above the focused element"
+        )
+        expect(
+            climb(1, parents: chain, roles: chainRoles(webAreaAt: 17)) == .undetermined
+                && climb(1, parents: chain, roles: chainRoles(webAreaAt: 6), maxLevels: 3) == .undetermined
+                && climb(1, parents: chain, roles: chainRoles(webAreaAt: 4), stopAfterSteps: 2) == .undetermined
+                && climb(1, parents: chain, roles: chainRoles(webAreaAt: 4), stopAfterSteps: 3) == .webArea(4),
+            "Web content walk: gives up after 15 levels or when the time budget runs out, and says so (not 'outside the web')"
+        )
+        expect(
+            climb(1, parents: chain, roles: chainRoles(webAreaAt: 6, windowAt: 4)) == .outsideWeb
+                && climb(1, parents: chain, roles: chainRoles(windowAt: 2)) == .outsideWeb
+                && climb(1, parents: chain, roles: { var r = chainRoles(webAreaAt: 6); r[3] = "AXApplication"; return r }()) == .outsideWeb
+                && climb(1, parents: chain, roles: { var r = chainRoles(webAreaAt: 4); r[1] = "AXWindow"; return r }()) == .webArea(4),
+            "Web content walk: stops at the window (or application) without finding a web area, and never looks at the focused element's own role"
+        )
+        expect(
+            climb(1, parents: [1: 2, 2: 3], roles: [2: "AXGroup", 3: "AXGroup"]) == .undetermined
+                && climb(1, parents: [1: 2], roles: [:]) == .undetermined
+                && climb(1, parents: [:], roles: [:]) == .undetermined
+                && climb(1, parents: [1: 2, 2: 3], roles: [2: "AXGroup"]) == .undetermined,
+            "Web content walk: an element without a parent, or a read that fails on the way, is undetermined, not 'outside the web'"
+        )
+
+        // ... and Electron detection (the bundle carries Electron Framework.framework), remembered per bundle path
+        let electronRoot = FileManager.default.temporaryDirectory.appendingPathComponent("tz-electron-selftest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: electronRoot) }
+        func makeApp(_ name: String, frameworks: [String]) -> URL {
+            let app = electronRoot.appendingPathComponent("\(name).app", isDirectory: true)
+            try? FileManager.default.createDirectory(at: app.appendingPathComponent("Contents", isDirectory: true), withIntermediateDirectories: true)
+            for framework in frameworks {
+                try? FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/Frameworks/\(framework)", isDirectory: true), withIntermediateDirectories: true)
+            }
+            return app
+        }
+        let electronApp = makeApp("Claude", frameworks: ["Electron Framework.framework", "Squirrel.framework"])
+        let chromeLikeApp = makeApp("Chrome", frameworks: ["Google Chrome Framework.framework"])
+        let nativeApp = makeApp("Notes", frameworks: [])
+        expect(
+            ContextInjector.isElectronApp(bundleURL: electronApp)
+                && !ContextInjector.isElectronApp(bundleURL: chromeLikeApp)
+                && !ContextInjector.isElectronApp(bundleURL: nativeApp)
+                && !ContextInjector.isElectronApp(bundleURL: electronRoot.appendingPathComponent("Missing.app", isDirectory: true))
+                && !ContextInjector.isElectronApp(bundleURL: nil),
+            "Electron detection: a bundle with Electron Framework.framework is an Electron app; Chrome, a native app, a missing bundle and no bundle are not"
+        )
+        try? FileManager.default.removeItem(at: electronApp)
+        try? FileManager.default.removeItem(at: nativeApp)
+        _ = try? FileManager.default.createDirectory(at: nativeApp.appendingPathComponent("Contents/Frameworks/Electron Framework.framework", isDirectory: true), withIntermediateDirectories: true)
+        expect(
+            ContextInjector.isElectronApp(bundleURL: electronApp) && !ContextInjector.isElectronApp(bundleURL: nativeApp),
+            "Electron detection: the answer is remembered per bundle path, so the bundle is not looked at again"
+        )
+
+        // 73. Delivery: what happens to the finished text, and whether the user's words are typed live while speaking
+        let allStatuses: [FocusedTextInputStatus] = [.editable, .notEditable, .unknown]
+        expect(
+            DictationDelivery.plan(status: .editable, accessibilityTrusted: true, targetAllowed: true) == .insert
+                && DictationDelivery.plan(status: .unknown, accessibilityTrusted: true, targetAllowed: true) == .insert
+                && DictationDelivery.plan(status: .notEditable, accessibilityTrusted: true, targetAllowed: true) == .offerCopy(.notEditable),
+            "Delivery: editable and unknown focus get the text as before; no text input in focus offers it on the Copy pill instead"
+        )
+        expect(
+            allStatuses.allSatisfy { DictationDelivery.plan(status: $0, accessibilityTrusted: false, targetAllowed: true) == .offerCopy(.accessibilityNotTrusted) }
+                && allStatuses.allSatisfy { DictationDelivery.plan(status: $0, accessibilityTrusted: true, targetAllowed: false) == .offerCopy(.targetNotAllowed) },
+            "Delivery: Accessibility not trusted and a blocked target also offer the Copy pill, whatever the focus check said"
+        )
+        expect(
+            DictationDelivery.CopyOfferReason.notEditable.traceBranch == "noFocus"
+                && DictationDelivery.CopyOfferReason.accessibilityNotTrusted.traceBranch == "untrusted"
+                && DictationDelivery.CopyOfferReason.targetNotAllowed.traceBranch == "blockedTarget",
+            "Delivery: the trace keeps the older branch names (noFocus, untrusted) for the Copy pill cases"
+        )
+        expect(
+            DictationDelivery.allowsLiveTyping(status: .editable)
+                && DictationDelivery.allowsLiveTyping(status: .unknown)
+                && !DictationDelivery.allowsLiveTyping(status: .notEditable),
+            "Live typing: allowed with a text input or an unknown focus, off for the whole dictation when no text input is in focus at the start"
+        )
+        expect(
+            !LiveInputSession.allowsLiveTyping(focusChecked: false, status: .editable)
+                && !LiveInputSession.allowsLiveTyping(focusChecked: false, status: .unknown)
+                && LiveInputSession.allowsLiveTyping(focusChecked: true, status: .editable)
+                && LiveInputSession.allowsLiveTyping(focusChecked: true, status: .unknown)
+                && !LiveInputSession.allowsLiveTyping(focusChecked: true, status: .notEditable),
+            "Live typing: nothing is typed until the first focus check has run, then it follows the result"
+        )
+
+        // 74. Copy pill: one-line preview, and the 8 s countdown with its pause while the pointer is over the pill
+        let longSentence = Array(repeating: "A long dictation that keeps going", count: 8).joined(separator: " ")
+        let longPreview = CopyPill.preview(of: longSentence)
+        expect(
+            CopyPill.preview(of: "Can you move the standup to 3 pm?") == "Can you move the standup to 3 pm?"
+                && CopyPill.preview(of: "  First line\n\nSecond\tline  \r\n") == "First line Second line"
+                && CopyPill.preview(of: "") == "" && CopyPill.preview(of: " \n ") == ""
+                && longPreview.count <= CopyPill.previewCharacterLimit && longPreview.hasSuffix("…") && !longPreview.contains("\n")
+                && longSentence.hasPrefix(String(longPreview.dropLast()))
+                && CopyPill.preview(of: String(repeating: "你", count: 200)).count == CopyPill.previewCharacterLimit
+                && CopyPill.preview(of: String(repeating: "a", count: CopyPill.previewCharacterLimit)).count == CopyPill.previewCharacterLimit
+                && !CopyPill.preview(of: String(repeating: "a", count: CopyPill.previewCharacterLimit)).hasSuffix("…"),
+            "Copy pill preview: whitespace and line breaks collapse to one line, and only a text over the limit is cut with an ellipsis"
+        )
+        let t0 = Date(timeIntervalSinceReferenceDate: 1_000)
+        var countdown = CopyPillCountdown()
+        expect(
+            CopyPillCountdown.visibleSeconds == 8 && CopyPillCountdown.copiedSeconds == 1
+                && countdown.remaining == 8 && !countdown.isRunning,
+            "Copy pill: it waits 8 s for a click and shows \"Copied\" for 1 s"
+        )
+        countdown.start(now: t0)
+        countdown.pause(now: t0.addingTimeInterval(3))
+        let afterFirstPause = countdown.remaining
+        countdown.pause(now: t0.addingTimeInterval(50))                       // already paused: nothing changes
+        countdown.resume(now: t0.addingTimeInterval(10))
+        countdown.resume(now: t0.addingTimeInterval(11))                      // already running: the clock is not restarted
+        countdown.pause(now: t0.addingTimeInterval(12))
+        let afterSecondPause = countdown.remaining
+        countdown.resume(now: t0.addingTimeInterval(20))
+        countdown.pause(now: t0.addingTimeInterval(200))
+        expect(
+            afterFirstPause == 5 && afterSecondPause == 3 && countdown.remaining == 0 && !countdown.isRunning,
+            "Copy pill: hovering pauses the countdown and moving away continues it from what was left (8 s - 3 s - 2 s, never below 0)"
+        )
+        countdown.start(now: t0.addingTimeInterval(300))
+        expect(countdown.remaining == 8 && countdown.isRunning, "Copy pill: a new offer starts a fresh 8 s countdown")
 
         print("==> Summary: \(passed) passed, \(failed) failed.")
         return failed == 0 ? 0 : 1

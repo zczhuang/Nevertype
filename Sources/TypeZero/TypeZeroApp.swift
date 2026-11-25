@@ -132,7 +132,7 @@ private struct TypeZeroMenuBarContent: View {
             Text("Recent dictations (click to copy)")
             ForEach(appState.history.prefix(5)) { rec in
                 Button(String(rec.polishedText.replacingOccurrences(of: "\n", with: " ").prefix(26))) {
-                    ContextInjector.saveToSafetyClipboard(rec.polishedText)
+                    ContextInjector.copyPlainText(rec.polishedText)
                 }
             }
         }

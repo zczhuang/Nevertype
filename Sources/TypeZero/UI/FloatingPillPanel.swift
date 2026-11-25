@@ -83,10 +83,17 @@ enum FloatingPillLayout {
     static var errorMaxHeightEstimate: CGFloat {
         CGFloat(errorMaxLines) * (errorFontSize * 1.25) + 2 * errorVerticalPadding
     }
+
+    // Copy pill: a one-line preview plus a Copy button. The capsule hugs its content up to `copyMaxWidth`; a longer preview is cut with an ellipsis.
+    static let copyMaxWidth: CGFloat = 216
+    static let copyHeight: CGFloat = 32
+    static let copyFontSize: CGFloat = 12
 }
 
 /// Ultra-minimalist, zero-text floating acoustic micro-pill:
 /// - Strictly NEVER displays live transcribed text (text streams exclusively inside the user's selected input box!).
+///   The one exception comes after the fact: when no text input could take the finished text, the Copy pill offers it
+///   (and is then the only state that takes mouse clicks).
 /// - Decouples Accessibility IPC caret queries onto a background serial queue (zero main-thread stalls!).
 /// - Glides at 60fps in pure memory and renders a 60/120fps continuous fluid sine-wave visualization.
 public final class FloatingPillController: @unchecked Sendable {
@@ -116,10 +123,21 @@ public final class FloatingPillController: @unchecked Sendable {
         guard panel == nil, let appState = boundAppState else { return }
 
         let contentView = FloatingPillView(appState: appState)
-        let hosting = NSHostingView(rootView: contentView)
+        let hosting = FloatingPillHostingView(rootView: contentView)
+        hosting.onHoverChange = { [weak appState] hovering in
+            MainActor.assumeIsolated {
+                appState?.copyPillHoverChanged(hovering)
+            }
+        }
+        self.panel = Self.makePanel(contentView: hosting, size: pillSize)
+    }
 
+    /// The pill's window: borderless and non-activating, and (being borderless) never key or main, so a click on it cannot take focus
+    /// from the app in front. Floats above other windows on every Space. Click-through until `setInteractive(true)`.
+    @MainActor
+    static func makePanel(contentView: NSView, size: CGSize) -> NSPanel {
         let p = NSPanel(
-            contentRect: NSRect(origin: .zero, size: pillSize),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -132,9 +150,16 @@ public final class FloatingPillController: @unchecked Sendable {
         p.ignoresMouseEvents = true
         p.hidesOnDeactivate = false
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        p.contentView = hosting
+        p.contentView = contentView
+        return p
+    }
 
-        self.panel = p
+    /// The panel is click-through (`ignoresMouseEvents`) in every state except the Copy pill, so the pill never gets in the way of
+    /// the app underneath. It stays a non-activating panel that cannot become key: a click on Copy does not move focus away from
+    /// the app in front.
+    @MainActor
+    public func setInteractive(_ interactive: Bool) {
+        panel?.ignoresMouseEvents = !interactive
     }
 
     @MainActor
@@ -266,6 +291,40 @@ public final class FloatingPillController: @unchecked Sendable {
     }
 }
 
+/// Hosting view of the pill panel. The panel is non-activating and Nevertype is never the active app, so every click on it is a
+/// "first mouse": without `acceptsFirstMouse` the Copy button would swallow the first click. A tracking area that works in an
+/// inactive app (`.activeAlways`) reports the pointer entering and leaving, which pauses the Copy pill's countdown.
+final class FloatingPillHostingView<Content: View>: NSHostingView<Content> {
+    var onHoverChange: ((Bool) -> Void)?
+
+    private static var hoverKey: String { "typezero.pillHover" }   // computed: generic types cannot hold stored statics
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas where area.userInfo?[Self.hoverKey] != nil {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: [Self.hoverKey: true]
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        if event.trackingArea?.userInfo?[Self.hoverKey] != nil { onHoverChange?(true) }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if event.trackingArea?.userInfo?[Self.hoverKey] != nil { onHoverChange?(false) }
+    }
+}
+
 /// Pure acoustic wave micro-capsule — ZERO live text duplication, ZERO per-frame SwiftUI state invalidations!
 struct FloatingPillView: View {
     @ObservedObject var appState: AppState
@@ -329,21 +388,11 @@ struct FloatingPillView: View {
                 .clipShape(Capsule())
                 .overlay(Capsule().strokeBorder(Color.black.opacity(0.06), lineWidth: 0.8))
 
-            case .savedToClipboard(let msg):
-                HStack(spacing: 5) {
-                    Image(systemName: "doc.on.clipboard.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color(red: 0.10, green: 0.42, blue: 1.0))
-                    Text(msg)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Color(red: 0.10, green: 0.10, blue: 0.14))
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 10)
-                .frame(height: 28)
-                .background(Color.white.opacity(0.96))
-                .clipShape(Capsule())
-                .overlay(Capsule().strokeBorder(Color(red: 0.10, green: 0.42, blue: 1.0).opacity(0.3), lineWidth: 0.8))
+            case .readyToCopy(let text):
+                FloatingPillCopyView(text: text) { appState.copyReadyText() }
+
+            case .copied:
+                FloatingPillCopiedView()
 
             case .error(let message):
                 FloatingPillErrorView(message: message)
@@ -377,6 +426,78 @@ struct FloatingPillThinkingView: View {
         .background(Color(red: 0.980, green: 0.980, blue: 0.984).opacity(0.95))
         .clipShape(Capsule())
         .overlay(Capsule().strokeBorder(TZTheme.blue.opacity(0.22), lineWidth: 0.8))
+    }
+}
+
+/// The Copy pill: shown when the cleaned text had nowhere to go (no text input in focus). A one-line preview of the text, cut with
+/// an ellipsis where it does not fit, and a Copy button. This is the only pill state that takes clicks (see
+/// `FloatingPillController.setInteractive`); `onCopy` puts the full text on the pasteboard.
+struct FloatingPillCopyView: View {
+    let text: String
+    var onCopy: () -> Void = {}
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(CopyPill.preview(of: text))
+                .font(.system(size: FloatingPillLayout.copyFontSize, weight: .medium))
+                .foregroundStyle(TZTheme.inkBody)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Button(action: onCopy) {
+                HStack(spacing: 4) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 10.5, weight: .semibold))
+                    Text("Copy")
+                        .font(.system(size: 11.5, weight: .semibold))
+                }
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 10)
+                .frame(height: FloatingPillLayout.copyHeight - 8)
+                .background(TZTheme.blue)
+                .clipShape(Capsule())
+            }
+            .buttonStyle(FloatingPillPressStyle())
+            .layoutPriority(1)
+            .accessibilityLabel("Copy the dictated text")
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 4)
+        .frame(height: FloatingPillLayout.copyHeight)
+        .background(.ultraThinMaterial)
+        .background(Color(red: 0.980, green: 0.980, blue: 0.984).opacity(0.95))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(TZTheme.blue.opacity(0.22), lineWidth: 0.8))
+        // Caps the width the capsule may use. The capsule itself still hugs its content inside this frame.
+        .frame(maxWidth: FloatingPillLayout.copyMaxWidth)
+    }
+}
+
+/// Shown for about a second after Copy is clicked: a check mark and "Copied".
+struct FloatingPillCopiedView: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(TZTheme.green)
+            Text("Copied")
+                .font(.system(size: FloatingPillLayout.copyFontSize, weight: .medium))
+                .foregroundStyle(TZTheme.inkBody)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.horizontal, 14)
+        .frame(height: FloatingPillLayout.copyHeight)
+        .background(.ultraThinMaterial)
+        .background(Color(red: 0.980, green: 0.980, blue: 0.984).opacity(0.95))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(TZTheme.green.opacity(0.30), lineWidth: 0.8))
+    }
+}
+
+/// Plain button that dims while pressed (the pill has no hover or focus ring of its own).
+private struct FloatingPillPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.opacity(configuration.isPressed ? 0.72 : 1)
     }
 }
 
